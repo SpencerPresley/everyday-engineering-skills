@@ -7,7 +7,7 @@ _Codex routes to the GPT-5.6 family (`gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, 
 ## Critical rules (read first)
 
 - **Never auto-apply review fixes.** If the user runs `/codex:review` or `/codex:adversarial-review` and you see the output, treat it as read-only: present findings ordered by severity, then STOP and ask which, if any, to fix. Do not edit files off a review — even obvious fixes.
-- **Return Codex output verbatim** — no paraphrasing or summarizing of review or task output. Keep file paths and line numbers exactly as reported.
+- **Return Codex output verbatim** — no paraphrasing or summarizing of review or task output. Keep file paths and line numbers exactly as reported. Verbatim means unfiltered, not mute: after the block you may add one `## Claude's assessment` section when you have something checkable — a finding you can disprove, a `file:line` it misread, a consequence it missed. Attach the evidence; skip the section when you only agree.
 - **`/codex:task` is write-capable** — Codex may edit files in the workspace. It is user-invoked only; you cannot start one.
 - If Codex isn't set up/authenticated, point the user to `/codex:setup`; don't improvise auth.
 
@@ -24,5 +24,5 @@ In this build, these are slash commands only the user can run — `codex:review`
 
 ## Internal skills
 
-- **codex-result-handling** — how to present Codex output; enforces the no-auto-fix rule.
+- **codex-result-handling** — the full reference for presenting Codex output. User-invoked only (`/codex:codex-result-handling`); the rules above are the working subset.
 - **codex-prompting** — XML-block prompt engineering for Codex (`<task>`, output contract, verification loop, grounding rules). User-invoked only (`/codex:codex-prompting`), so it will not appear in your skill list; `codex:using-codex` carries the condensed version.

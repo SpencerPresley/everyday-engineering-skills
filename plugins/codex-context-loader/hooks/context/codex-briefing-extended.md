@@ -7,7 +7,7 @@ _Codex routes to the GPT-5.6 family; the model and reasoning effort come from th
 ## Critical rules (always apply)
 
 - **Reviews are READ-ONLY. Never auto-apply fixes.** After presenting `codex:review` / `codex:adversarial-review` findings, STOP — don't edit a single file, even an obvious fix. Ask the user which to fix.
-- **Return Codex output verbatim** — findings ordered by severity, exact file:line. No paraphrasing.
+- **Return Codex output verbatim** — findings ordered by severity, exact file:line. No paraphrasing. One `## Claude's assessment` section may follow the block when you have checkable disagreement with evidence attached; Codex and Claude fail differently, and a review nobody contests is worth less.
 - **`/codex:task` is write-capable** (Codex edits files) and user-invoked only; `review` / `adversarial-review` are read-only and yours to run.
 
 ## Commands you can invoke
