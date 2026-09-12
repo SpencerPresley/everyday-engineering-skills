@@ -37,12 +37,18 @@ INSTALL_PATH="$(jq -r --arg id "$ACTIVE_ID" '.plugins[$id][0].installPath // emp
 
 # Capability detection: review.md WITHOUT `disable-model-invocation` => the
 # review commands are model-invokable (fork) => extended briefing.
-REVIEW_MD="$INSTALL_PATH/commands/review.md"
-if [ -f "$REVIEW_MD" ] && ! grep -q 'disable-model-invocation' "$REVIEW_MD"; then
-  CAPABILITY="extended"
-else
-  CAPABILITY="base"
-fi
+# review.md may live under commands/ or skills/review/ — a plugin is free to
+# move it, and both surfaces behave identically. Probe each, and only treat a
+# file we actually found as evidence.
+CAPABILITY="base"
+for REVIEW_MD in "$INSTALL_PATH/commands/review.md" "$INSTALL_PATH/skills/review/SKILL.md"; do
+  if [ -f "$REVIEW_MD" ]; then
+    if ! grep -q 'disable-model-invocation' "$REVIEW_MD"; then
+      CAPABILITY="extended"
+    fi
+    break
+  fi
+done
 
 # Pick the briefing by mode + capability.
 if [ "$MODE" = "SubagentStart" ]; then

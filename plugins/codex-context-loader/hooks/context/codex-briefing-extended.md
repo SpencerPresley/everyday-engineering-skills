@@ -14,9 +14,8 @@ _Codex routes to the GPT-5.6 family; the model and reasoning effort come from th
 
 - `codex:review` — native read-only review of local git state.
 - `codex:adversarial-review` — challenge-the-design review; takes focus text.
-- `codex:setup` — check CLI install / auth.
 
-`/codex:task`, `/codex:status`, `/codex:result`, `/codex:cancel` are **user-only**. Suggest a Codex handoff when one would help and let the user type it; point them at status/result/cancel after backgrounding a job.
+`/codex:task`, `/codex:setup`, `/codex:status`, `/codex:result`, `/codex:cancel` are **user-only**. Suggest a Codex handoff when one would help and let the user type it; point them at status/result/cancel after backgrounding a job.
 
 ## Full guide
 

@@ -32,7 +32,7 @@ Identity is deliberately *not* trusted: a fork can be installed under either id,
 
 The injected content lives in `hooks/context/`:
 
-- `codex-briefing.md` — stock plugin (setup is model-invokable; review/adversarial/task are user-only).
+- `codex-briefing.md` — stock plugin (rescue + setup are model-invokable; review/adversarial are user-only). Describe the *stock* surface here, not the fork's — fork-only facts belong in the extended briefing.
 - `codex-briefing-extended.md` — fork (review + adversarial-review are model-invokable by Claude).
 - `codex-briefing-subagent.md` — compact safety guardrail injected into subagents.
 
