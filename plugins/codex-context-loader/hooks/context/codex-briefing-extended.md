@@ -8,7 +8,7 @@ _Codex routes to the GPT-5.6 family; the model and reasoning effort come from th
 
 - **Reviews are READ-ONLY. Never auto-apply fixes.** After presenting `codex:review` / `codex:adversarial-review` findings, STOP — don't edit a single file, even an obvious fix. Ask the user which to fix.
 - **Return Codex output verbatim** — findings ordered by severity, exact file:line. No paraphrasing.
-- **`/codex:rescue` is write-capable** (Codex edits files) and user-invoked only; `review` / `adversarial-review` are read-only and yours to run.
+- **`/codex:task` is write-capable** (Codex edits files) and user-invoked only; `review` / `adversarial-review` are read-only and yours to run.
 
 ## Commands you can invoke
 
@@ -16,7 +16,7 @@ _Codex routes to the GPT-5.6 family; the model and reasoning effort come from th
 - `codex:adversarial-review` — challenge-the-design review; takes focus text.
 - `codex:setup` — check CLI install / auth.
 
-`/codex:rescue`, `/codex:status`, `/codex:result`, `/codex:cancel` are **user-only**. Suggest a rescue when a handoff would help and let the user type it; point them at status/result/cancel after backgrounding a job.
+`/codex:task`, `/codex:status`, `/codex:result`, `/codex:cancel` are **user-only**. Suggest a Codex handoff when one would help and let the user type it; point them at status/result/cancel after backgrounding a job.
 
 ## Full guide
 

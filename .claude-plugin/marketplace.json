@@ -26,7 +26,7 @@
       "name": "codex-context-loader",
       "source": "./plugins/codex-context-loader",
       "description": "Dynamically injects detailed Codex plugin context into sessions only when the Codex plugin is enabled.",
-      "version": "1.2.1",
+      "version": "1.2.2",
       "keywords": [
         "codex",
         "context",
