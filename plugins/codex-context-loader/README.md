@@ -20,11 +20,10 @@ This plugin solves three problems:
 
 A `SessionStart` and a `SubagentStart` hook run the same bash script, which:
 
-1. Finds an enabled Codex plugin id (checks `codex@SpencerPresley`, then `codex@openai-codex`) in `~/.claude/settings.json`. If none is enabled, exits silently with no token cost.
-2. Finds an enabled Codex plugin by scanning `installed_plugins.json` for ids starting `codex@` and checking enablement in user settings *and* both project-scoped settings files — a plugin enabled for one project only appears in `.claude/settings.local.json`.
-3. Picks that id's install entry for the current project, falling back to a user-scoped entry, then to the highest version. Installs are per-project and pinned at install time, so one id commonly holds several entries at different versions; taking the first one means inspecting whichever project installed first.
-4. Inspects the chosen install's review surface — `commands/review.md`, or `skills/review/SKILL.md` if the plugin keeps it there instead. **Capability, not identity, decides the briefing** — if `disable-model-invocation` is absent, the review commands are model-invokable (a fork), so the *extended* briefing is used; otherwise the *base* briefing.
-3. Injects the right briefing as `hookSpecificOutput.additionalContext`:
+1. Finds an enabled Codex plugin by scanning `installed_plugins.json` for ids starting `codex@` and checking enablement in user settings *and* both project-scoped settings files — a plugin enabled for one project only appears in `.claude/settings.local.json`.
+2. Picks that id's install entry for the current project, falling back to a user-scoped entry, then to the highest version. Installs are per-project and pinned at install time, so one id commonly holds several entries at different versions; taking the first one means inspecting whichever project installed first.
+3. Inspects the chosen install's review surface — `commands/review.md`, or `skills/review/SKILL.md` if the plugin keeps it there instead. **Capability, not identity, decides the briefing** — if `disable-model-invocation` is absent, the review commands are model-invokable (a fork), so the *extended* briefing is used; otherwise the *base* briefing.
+4. Injects the right briefing as `hookSpecificOutput.additionalContext`:
    - **Session start** → the full briefing (`codex-briefing-extended.md` for a fork, `codex-briefing.md` for stock).
    - **Subagent start** → a compact guardrail (`codex-briefing-subagent.md`), and only when the review commands are model-invokable (subagents can invoke them, but `SessionStart` never fires for subagents, so they'd otherwise get no guardrail). In the stock case, subagents get nothing.
 
