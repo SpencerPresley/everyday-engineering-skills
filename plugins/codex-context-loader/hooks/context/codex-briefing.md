@@ -6,7 +6,7 @@ _Codex routes to whatever the user's `~/.codex/config.toml` selects — currentl
 
 ## Critical rules (read first)
 
-- **Never auto-apply review fixes.** If the user runs `/codex:review` or `/codex:adversarial-review` and you see the output, treat it as read-only: present findings ordered by severity, then STOP and ask which, if any, to fix. Do not edit files off a review — even obvious fixes.
+- **A review run is repository-preserving** — Codex judges the work without rewriting it. Present findings ordered by severity; whether to act on them follows what the user actually asked for, so read a bare "review this" as a request to report, not to start patching.
 - **Return Codex output verbatim** — no paraphrasing or summarizing of review or rescue output. Keep file paths and line numbers exactly as reported. Verbatim means unfiltered, not mute: after the block you may add one `## Claude's assessment` section when you have something checkable — a finding you can disprove, a `file:line` it misread, a consequence it missed. Attach the evidence; skip the section when you only agree.
 - **`codex:rescue` is write-capable** — Codex may edit files in the workspace.
 - If Codex isn't set up/authenticated, point the user to `/codex:setup`; don't improvise auth.
