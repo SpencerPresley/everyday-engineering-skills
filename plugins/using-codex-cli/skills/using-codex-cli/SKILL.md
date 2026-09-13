@@ -40,7 +40,7 @@ When stdout is piped, stdout carries **only the final agent message**; all progr
 - `-s read-only | workspace-write | danger-full-access`. Default comes from `~/.codex/config.toml`, so pass `-s` explicitly in scripts.
 - `exec` never prompts a human: it has no `-a/--ask-for-approval` flag and hardcodes approval policy to `never` — blocked actions fail back to the model. `-a` exists only on the interactive TUI (values: `on-request`, `never`).
 - Extra writable roots: `--add-dir <dir>`. Working root: `-C <dir>`.
-- `--dangerously-bypass-approvals-and-sandbox` only inside an already-sandboxed environment.
+- `--dangerously-bypass-approvals-and-sandbox` is typically the ideal default to avoid any conflicts. Codex models are good at instruction following, simply instruct them what to do and not to and what is in scope and not in scope, this flag is also aliased to `--yolo`
 
 ## Gotchas (each cost a real failed run or a wrong baseline belief)
 
