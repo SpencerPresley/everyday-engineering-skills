@@ -11,29 +11,65 @@ set -euo pipefail
 # Arg 1: hook mode — "SessionStart" (default) or "SubagentStart".
 
 MODE="${1:-SessionStart}"
-SETTINGS="$HOME/.claude/settings.json"
 INSTALLED="$HOME/.claude/plugins/installed_plugins.json"
 CONTEXT_DIR="${CLAUDE_PLUGIN_ROOT}/hooks/context"
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
-# Need jq and the config files; otherwise stay silent (zero token cost).
+# Need jq and the install ledger; otherwise stay silent (zero token cost).
 command -v jq >/dev/null 2>&1 || exit 0
-[ -f "$SETTINGS" ] || exit 0
 [ -f "$INSTALLED" ] || exit 0
 
-# Find an enabled Codex plugin id. Prefer the fork's distinct id, fall back to
-# the upstream id (which may itself be a fork installed under the old name).
+# Enablement can live in user settings or in either project-scoped settings
+# file, and a plugin enabled for one project only appears in the latter. Check
+# all of them rather than assuming user scope.
+SETTINGS_FILES=(
+  "$HOME/.claude/settings.json"
+  "$PROJECT_DIR/.claude/settings.json"
+  "$PROJECT_DIR/.claude/settings.local.json"
+)
+
+is_enabled() {
+  local id="$1" file
+  for file in "${SETTINGS_FILES[@]}"; do
+    [ -f "$file" ] || continue
+    if jq -e --arg id "$id" '.enabledPlugins[$id] == true' "$file" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Discover Codex plugin ids from the ledger instead of guessing marketplace
+# names. `codex@spencer-codex`, `codex@openai-codex`, and any other fork id all
+# match; this loader itself (codex-context-loader@...) must not.
 ACTIVE_ID=""
-for ID in "codex@SpencerPresley" "codex@openai-codex"; do
-  if jq -e --arg id "$ID" '.enabledPlugins[$id] == true' "$SETTINGS" >/dev/null 2>&1; then
+while IFS= read -r ID; do
+  if is_enabled "$ID"; then
     ACTIVE_ID="$ID"
     break
   fi
-done
+done < <(jq -r '.plugins | keys[] | select(startswith("codex@"))' "$INSTALLED")
 [ -n "$ACTIVE_ID" ] || exit 0
 
-# Locate the installed plugin so we can inspect its commands.
-INSTALL_PATH="$(jq -r --arg id "$ACTIVE_ID" '.plugins[$id][0].installPath // empty' "$INSTALLED")"
+# Installs are per-project and each entry is pinned to the version that project
+# installed, so the ledger holds several entries under one id at different
+# versions. Prefer this project's entry, then a user-scoped one, then the
+# highest version — never simply the first, which is whichever project happened
+# to install first.
+INSTALL_PATH="$(
+  jq -r --arg id "$ACTIVE_ID" --arg dir "$PROJECT_DIR" '
+    .plugins[$id] as $entries
+    | ( [ $entries[] | select(.projectPath == $dir) ]
+        + [ $entries[] | select(.scope == "user") ]
+      ) as $preferred
+    | if ($preferred | length) > 0
+      then $preferred[0].installPath
+      else ( $entries | sort_by(.version | split(".") | map(tonumber? // 0)) | last | .installPath )
+      end // empty
+  ' "$INSTALLED"
+)"
 [ -n "$INSTALL_PATH" ] || exit 0
+[ -d "$INSTALL_PATH" ] || exit 0
 
 # Capability detection: review.md WITHOUT `disable-model-invocation` => the
 # review commands are model-invokable (fork) => extended briefing.
