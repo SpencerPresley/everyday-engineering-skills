@@ -7,7 +7,7 @@ description: Use when driving the OpenAI Codex CLI (`codex`) directly from Bash,
 
 Headless Codex = `codex exec`. Everything here was verified by execution against codex-cli 0.149.1 (2026-08); on a newer major version, re-check surprising behavior with `--help` before relying on it.
 
-**Precedence:** if the `codex` (spencer-codex) plugin is installed and the task is a review or a delegated fix/investigation, use its `/codex:*` commands instead (see the `codex:using-codex` skill) — they add job tracking and background handling. Use the raw CLI for scripting, automation, session surgery, and machines without the plugin.
+**Precedence:** if the `codex` (spencer-codex) plugin is installed and the task is a review or a delegated fix/investigation, use its `/codex:*` skills instead — they add job tracking and background handling, and each carries its own usage in its body. Use the raw CLI for scripting, automation, session surgery, and machines without the plugin.
 
 ## Rules
 
