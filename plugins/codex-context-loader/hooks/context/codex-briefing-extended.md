@@ -19,6 +19,6 @@ _Codex routes to the GPT-5.6 family; the model and reasoning effort come from th
 
 A backgrounded review notifies you when it finishes and writes the rendered review to its own output file — read that file to collect it. Don't poll, and don't reach for `/codex:status` or `/codex:result` to get output you were already handed. Point the user at `/codex:result <id>` when *they* want to re-read a finished job, since they never saw your notification.
 
-## Full guide
+## Where the detail lives
 
-**Before running a Codex review or delegating work, invoke the `codex:using-codex` skill.** It has every flag, the review output schema, when-to-use guidance for each command, background-vs-wait, and how to prompt Codex. This briefing is just the menu + the safety rules; the skill is the manual.
+Each skill carries its own flags, targeting rules, and reporting contract — invoke the one you need and read its body; there is no separate manual to load first. `/codex:codex-prompting` and `/codex:codex-result-handling` are user-invoked references if the user wants the long form.
