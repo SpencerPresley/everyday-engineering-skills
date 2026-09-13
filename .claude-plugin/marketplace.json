@@ -1,111 +1,86 @@
 {
-  "name": "everyday-engineering-skills",
-  "owner": {
-    "name": "Spencer Presley"
-  },
-  "metadata": {
-    "description": "A collection of simple but powerful Claude Code plugins"
-  },
-  "plugins": [
-    {
-      "name": "claude-md-discovery-extended",
-      "source": "./plugins/claude-md-discovery-extended",
-      "description": "Auto-discovers CLAUDE.md/AGENTS.md files from directories outside your project tree, deduplicated by content hash (worktrees, clones, copied templates stay silent), with re-read nudges when loaded instruction files change on disk.",
-      "version": "0.4.0",
-      "keywords": [
-        "claude-md",
-        "agents-md",
-        "discovery",
-        "hooks",
-        "auto-discovery",
-        "worktrees",
-        "context-health"
-      ]
-    },
-    {
-      "name": "codex-context-loader",
-      "source": "./plugins/codex-context-loader",
-      "description": "Dynamically injects detailed Codex plugin context into sessions only when the Codex plugin is enabled.",
-      "version": "1.2.5",
-      "keywords": [
-        "codex",
-        "context",
-        "dynamic-loading",
-        "hooks"
-      ]
-    },
-    {
-      "name": "adversarial-review",
-      "source": "./plugins/adversarial-review",
-      "description": "An adversarial code/plan reviewer that uses a Codex-style review contract while reviewing only the exact slice you name.",
-      "version": "0.1.5",
-      "keywords": [
-        "code-review",
-        "adversarial",
-        "agent",
-        "skill",
-        "plan-review"
-      ]
-    },
-    {
-      "name": "fix-docstrings",
-      "source": "./plugins/fix-docstrings",
-      "description": "Writes Google-style Python docstrings during development and audits existing docstrings for compliance. A hook injects the continuation-line rule just-in-time when a LangChain tool explicitly enables parse_docstring.",
-      "version": "0.2.0",
-      "keywords": [
-        "docstrings",
-        "python",
-        "google-style",
-        "langchain",
-        "skill",
-        "hooks"
-      ]
-    },
-    {
-      "name": "llm-input-engineering",
-      "source": "./plugins/llm-input-engineering",
-      "description": "Designs and diagnoses compiled LLM input across prompts, chat templates, tool schemas, structured decoding, prefix caches, retrieval, eviction, and compaction.",
-      "version": "0.1.0",
-      "keywords": [
-        "prompt-engineering",
-        "context-engineering",
-        "tools",
-        "structured-output",
-        "chat-template",
-        "prefix-cache",
-        "agents",
-        "skill"
-      ]
-    },
-    {
-      "name": "using-codex-cli",
-      "source": "./plugins/using-codex-cli",
-      "description": "Execution-verified reference for driving the OpenAI Codex CLI headlessly: codex exec, session resume/fork, non-interactive reviews, JSONL output, sandbox and trust flags, and the stale-flag traps agents fall into.",
-      "version": "0.1.0",
-      "keywords": [
-        "codex",
-        "cli",
-        "headless",
-        "codex-exec",
-        "automation",
-        "skill"
-      ]
-    },
-    {
-      "name": "pyrefly-lsp",
-      "source": "./plugins/pyrefly-lsp",
-      "description": "Python code intelligence via Pyrefly's language server with deterministic workspace indexing. Needs only uv on PATH \u2014 no venv setup, no project-declared dependency.",
-      "version": "0.3.0",
-      "keywords": [
-        "code-intelligence",
-        "django",
-        "hooks",
-        "lsp",
-        "preflight",
-        "pyrefly",
-        "python",
-        "type-checking"
-      ]
-    }
-  ]
+	"name": "everyday-engineering-skills",
+	"owner": {
+		"name": "Spencer Presley"
+	},
+	"metadata": {
+		"description": "A collection of simple but powerful Claude Code plugins"
+	},
+	"plugins": [
+		{
+			"name": "claude-md-discovery-extended",
+			"source": "./plugins/claude-md-discovery-extended",
+			"description": "Auto-discovers CLAUDE.md/AGENTS.md files from directories outside your project tree, deduplicated by content hash (worktrees, clones, copied templates stay silent), with re-read nudges when loaded instruction files change on disk.",
+			"version": "0.4.0",
+			"keywords": [
+				"claude-md",
+				"agents-md",
+				"discovery",
+				"hooks",
+				"auto-discovery",
+				"worktrees",
+				"context-health"
+			]
+		},
+		{
+			"name": "codex-context-loader",
+			"source": "./plugins/codex-context-loader",
+			"description": "Dynamically injects detailed Codex plugin context into sessions only when the Codex plugin is enabled.",
+			"version": "1.2.5",
+			"keywords": ["codex", "context", "dynamic-loading", "hooks"]
+		},
+		{
+			"name": "adversarial-review",
+			"source": "./plugins/adversarial-review",
+			"description": "An adversarial code/plan reviewer that uses a Codex-style review contract while reviewing only the exact slice you name.",
+			"version": "0.1.5",
+			"keywords": ["code-review", "adversarial", "agent", "skill", "plan-review"]
+		},
+		{
+			"name": "fix-docstrings",
+			"source": "./plugins/fix-docstrings",
+			"description": "Writes Google-style Python docstrings during development and audits existing docstrings for compliance. A hook injects the continuation-line rule just-in-time when a LangChain tool explicitly enables parse_docstring.",
+			"version": "0.2.0",
+			"keywords": ["docstrings", "python", "google-style", "langchain", "skill", "hooks"]
+		},
+		{
+			"name": "llm-input-engineering",
+			"source": "./plugins/llm-input-engineering",
+			"description": "Designs and diagnoses compiled LLM input across prompts, chat templates, tool schemas, structured decoding, prefix caches, retrieval, eviction, and compaction.",
+			"version": "0.1.0",
+			"keywords": [
+				"prompt-engineering",
+				"context-engineering",
+				"tools",
+				"structured-output",
+				"chat-template",
+				"prefix-cache",
+				"agents",
+				"skill"
+			]
+		},
+		{
+			"name": "using-codex-cli",
+			"source": "./plugins/using-codex-cli",
+			"description": "Execution-verified reference for driving the OpenAI Codex CLI headlessly: codex exec, session resume/fork, non-interactive reviews, JSONL output, sandbox and trust flags, and the stale-flag traps agents fall into.",
+			"version": "0.2.0",
+			"keywords": ["codex", "cli", "headless", "codex-exec", "automation", "skill"]
+		},
+		{
+			"name": "pyrefly-lsp",
+			"source": "./plugins/pyrefly-lsp",
+			"description": "Python code intelligence via Pyrefly's language server with deterministic workspace indexing. Needs only uv on PATH \u2014 no venv setup, no project-declared dependency.",
+			"version": "0.3.0",
+			"keywords": [
+				"code-intelligence",
+				"django",
+				"hooks",
+				"lsp",
+				"preflight",
+				"pyrefly",
+				"python",
+				"type-checking"
+			]
+		}
+	]
 }
