@@ -21,7 +21,7 @@ This plugin solves three problems:
 A `SessionStart` and a `SubagentStart` hook run the same bash script, which:
 
 1. Finds an enabled Codex plugin id (checks `codex@SpencerPresley`, then `codex@openai-codex`) in `~/.claude/settings.json`. If none is enabled, exits silently with no token cost.
-2. Locates that plugin's install path from `~/.claude/plugins/installed_plugins.json` and inspects its `commands/review.md`. **Capability, not identity, decides the briefing** — if `disable-model-invocation` is absent, the review commands are model-invokable (a fork), so the *extended* briefing is used; otherwise the *base* briefing.
+2. Locates that plugin's install path from `~/.claude/plugins/installed_plugins.json` and inspects its review surface — `commands/review.md`, or `skills/review/SKILL.md` if the plugin keeps it there instead. **Capability, not identity, decides the briefing** — if `disable-model-invocation` is absent, the review commands are model-invokable (a fork), so the *extended* briefing is used; otherwise the *base* briefing.
 3. Injects the right briefing as `hookSpecificOutput.additionalContext`:
    - **Session start** → the full briefing (`codex-briefing-extended.md` for a fork, `codex-briefing.md` for stock).
    - **Subagent start** → a compact guardrail (`codex-briefing-subagent.md`), and only when the review commands are model-invokable (subagents can invoke them, but `SessionStart` never fires for subagents, so they'd otherwise get no guardrail). In the stock case, subagents get nothing.
