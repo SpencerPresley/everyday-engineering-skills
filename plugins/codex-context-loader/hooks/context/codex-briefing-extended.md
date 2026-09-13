@@ -15,7 +15,9 @@ _Codex routes to the GPT-5.6 family; the model and reasoning effort come from th
 - `codex:review` — native repository-preserving review of local git state.
 - `codex:adversarial-review` — challenge-the-design review; takes focus text.
 
-`/codex:task`, `/codex:setup`, `/codex:status`, `/codex:result`, `/codex:cancel` are **user-only**. Suggest a Codex handoff when one would help and let the user type it; point them at status/result/cancel after backgrounding a job.
+`/codex:task`, `/codex:setup`, `/codex:result`, `/codex:cancel`, `/codex:transfer` are **user-only**; `/codex:status` is yours. Suggest a Codex handoff when one would help and let the user type it.
+
+A backgrounded review notifies you when it finishes and writes the rendered review to its own output file — read that file to collect it. Don't poll, and don't reach for `/codex:status` or `/codex:result` to get output you were already handed. Point the user at `/codex:result <id>` when *they* want to re-read a finished job, since they never saw your notification.
 
 ## Full guide
 
