@@ -573,8 +573,17 @@ class State:
 
         `ExitWorktree` clears Claude Code's memory-file caches, and
         `EnterWorktree` moves the session into a different checkout, so
-        nested loads recorded against the old tree no longer describe
-        what is in context. Session-wide loads survive.
+        nested loads recorded against the old tree no longer describe what
+        Claude Code has loaded. Session-wide loads survive.
+
+        Flags are deliberately kept. A flag means the model read the file
+        into its transcript, and a transcript is not cleared by changing
+        directories — the content is still there. Dropping flags here
+        would discard true knowledge and re-surface a file the model has
+        already read. (Flags on the old tree's paths cannot wrongly
+        suppress the new tree's copies either: paths are absolute, so a
+        new checkout's files are new keys, and identical copies are
+        suppressed by content hash on purpose.)
 
         Returns:
             list[str]: The paths forgotten.
@@ -587,12 +596,6 @@ class State:
         for path in dropped:
             del self.loads[path]
             self._appends.append({"t": "unload", "p": path})
-        for path, agent in list(self.flags):
-            del self.flags[(path, agent)]
-            record = {"t": "unflag", "p": path}
-            if agent:
-                record["a"] = agent
-            self._appends.append(record)
         return dropped
 
     def drop_flags(self) -> list[str]:

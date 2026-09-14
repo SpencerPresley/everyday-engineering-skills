@@ -66,7 +66,7 @@ Claude Code loads a memory file once and never reloads it, so editing a `CLAUDE.
 
 - **`/clear`** wipes the context, so all state is deleted; Claude Code re-fires `session_start` loads, which reseeds it for free.
 - **Compaction** drops transcript-only content, so plugin-flagged files are forgotten and may re-flag. Natively loaded files are re-reported with `load_reason: compact`.
-- **Worktree switches** (`EnterWorktree` / `ExitWorktree`) clear Claude Code's memory-file caches and move the session into a different checkout, so lazily loaded files are forgotten. Detected by tool name, not by a `cwd` change — a plain `cd` moves `cwd` too and must not invalidate anything.
+- **Worktree switches** (`EnterWorktree` / `ExitWorktree`) clear Claude Code's memory-file caches and move the session into a different checkout, so lazily *loaded* files are forgotten. Files the model **read** are not: a transcript isn't cleared by changing directories, so that content is still in context. Detected by tool name, not by a `cwd` change — a plain `cd` moves `cwd` too and must not invalidate anything.
 - **Resume** keeps state, so a resumed session isn't re-nagged about files in its restored context.
 
 ## Hooks

@@ -1069,3 +1069,42 @@ class TestPseudoFilesystems:
     def test_real_path_still_found_alongside_dev_null(self, layout):
         found = lib.bash_directories("grep -rn x pkg/ 2>/dev/null", layout["project"])
         assert found == [layout["pkg"]]
+
+
+class TestWorktreeKeepsTranscript:
+    """A worktree switch clears memory caches, not the transcript."""
+
+    def _worktree(self, layout):
+        wt = Path(layout["project"]) / ".claude" / "worktrees" / "wt"
+        (wt / "pkg").mkdir(parents=True)
+        (wt / "pkg" / "mod.py").write_text("x = 1\n")
+        return wt
+
+    def _switch(self, session, layout):
+        wt = self._worktree(layout)
+        session.tools([{"tool_name": "EnterWorktree", "tool_input": {"name": "wt"}}],
+                      cwd=str(wt))
+        session.cwd = os.path.realpath(wt)
+        return wt
+
+    def test_read_file_not_reflagged_after_switch(self, session, layout):
+        # The model read this file; changing directories does not remove
+        # it from the transcript, so it must not be surfaced again.
+        session.tools([read_call(layout["pkg_md"])])
+        self._switch(session, layout)
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert session.turn() == []
+
+    def test_flagged_file_not_reflagged_after_switch(self, session, layout):
+        session.bash(f"cat {layout['sibling']}/sib.py")
+        assert session.turn() == [layout["sibling_md"]]
+        self._switch(session, layout)
+        session.bash(f"cat {layout['sibling']}/sib.py")
+        assert session.turn() == []
+
+    def test_native_load_is_still_dropped_after_switch(self, session, layout):
+        session.loaded(layout["pkg_md"], "nested_traversal",
+                       trigger=f"{layout['pkg']}/mod.py")
+        self._switch(session, layout)
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert session.turn() == [layout["pkg_md"]]
