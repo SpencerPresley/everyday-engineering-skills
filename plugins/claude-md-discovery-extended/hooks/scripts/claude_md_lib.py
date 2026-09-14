@@ -69,6 +69,14 @@ MAIN_AGENT = ""
 GRACE_SECS = 3.0
 
 WALK_MAX_DEPTH = 25
+
+# Hook output, including additionalContext, is capped at 10,000 characters;
+# past that Claude Code spills it to a file and substitutes a preview, which
+# would defeat the point of inlining. Stay under with room for the wrapper
+# prose. A single oversized file is sent to the read-it-yourself path rather
+# than being allowed to crowd out every other finding.
+INLINE_BUDGET = 8600
+INLINE_MAX_FILE = 6000
 BASH_MAX_CANDIDATES = 20
 
 # `2>/dev/null` and friends appear in a large share of commands and always
@@ -777,8 +785,45 @@ def candidate_files(
     return found
 
 
+def _read_text(path: str) -> str | None:
+    """Return a file's text, or `None` when it cannot be decoded or read.
+
+    Args:
+        path (str): File to read.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read(INLINE_MAX_FILE + 1)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _render(path: str, text: str) -> str:
+    """Render one instruction file the way Claude Code renders its own.
+
+    A natively loaded memory file reaches the model as
+    `Contents of <path>:` inside a `<system-reminder>`, and hook
+    `additionalContext` is wrapped in a `<system-reminder>` too, so
+    matching the inner shape puts this content in the same framing the
+    model already associates with project instructions.
+
+    Args:
+        path (str): The instruction file's path.
+        text (str): Its contents.
+    """
+    return f"Contents of {path}:\n\n{text.rstrip()}\n"
+
+
 def build_message(paths: list[str], changed: list[str] | None = None) -> str:
-    """Build the instruction injected for unloaded or stale files.
+    """Build the context injected for unloaded or stale instruction files.
+
+    Contents are inlined rather than announced. Telling the model to read
+    the file costs a round trip, depends on it complying, and delivers the
+    text as a line-numbered tool result; inlining delivers it in the same
+    `<system-reminder>` framing Claude Code uses for memory it loads
+    itself. Files too large to inline fall back to the announcement, which
+    also keeps the cheap path for the case where inlining would be most
+    expensive if the finding turned out to be wrong.
 
     Args:
         paths (list[str]): Instruction files the agent has not seen.
@@ -788,47 +833,72 @@ def build_message(paths: list[str], changed: list[str] | None = None) -> str:
     Returns:
         str: The message to inject as additional context.
     """
-    sections = []
-    if len(paths) == 1:
+    budget = INLINE_BUDGET
+    fresh: list[str] = []
+    stale: list[str] = []
+    overflow: list[str] = []
+
+    for path, is_stale in (
+        [(p, False) for p in paths] + [(p, True) for p in (changed or [])]
+    ):
+        text = _read_text(path)
+        if text is None or len(text) > INLINE_MAX_FILE:
+            overflow.append(path)
+            continue
+        block = _render(path, text)
+        if len(block) > budget:
+            overflow.append(path)
+            continue
+        budget -= len(block)
+        (stale if is_stale else fresh).append(block)
+
+    sections: list[str] = []
+
+    if fresh:
         sections.append(
-            "IMPORTANT: You must use the Read tool to read the CLAUDE.md "
-            f"here: {paths[0]}"
+            "These instruction files apply to directories this session has "
+            "worked in, but Claude Code did not load them: a nested "
+            "CLAUDE.md is only auto-loaded when a file tool reaches its "
+            "directory, and Bash operations bypass that. Treat the contents "
+            "below as project instructions.\n\n"
+            + "\n".join(fresh)
         )
-    elif paths:
-        listing = "\n".join(f"  - {path}" for path in paths)
-        sections.append(
-            "IMPORTANT: You must use the Read tool to read each of these "
-            "instruction files:\n"
-            f"{listing}"
-        )
-    if changed:
-        listing = "\n".join(f"  - {path}" for path in changed)
-        plural = "files have" if len(changed) > 1 else "file has"
+
+    if stale:
+        plural = "files have" if len(stale) > 1 else "file has"
         sections.append(
             f"The following instruction {plural} changed on disk since the "
-            "content was loaded into your context. IMPORTANT: You must "
-            "re-read them with the Read tool — what you are holding is "
-            f"stale.\n{listing}"
+            "content was loaded into your context. What follows is current "
+            "and supersedes the version you are holding.\n\n"
+            + "\n".join(stale)
         )
-    head = "\n\n".join(sections)
+
+    if overflow:
+        listing = "\n".join(f"  - {path}" for path in overflow)
+        verb = "it" if len(overflow) == 1 else "each of them"
+        sections.append(
+            "These instruction files are too large to include here. "
+            f"IMPORTANT: You must use the Read tool to read {verb}:\n"
+            f"{listing}"
+        )
+
     return (
         "<claude-md-discovery-extended>\n"
-        f"{head}\n"
+        + "\n\n".join(sections)
+        + "\n\n"
+        "This is a user-installed hook which detects CLAUDE.md files that do "
+        "not load because Claude Code cannot tell which directories you are "
+        "looking at when you use the Bash tool for file operations. Do not "
+        "change how you are working. It will notify you again if another "
+        "unloaded CLAUDE.md appears, and never about one already in your "
+        "context.\n"
         "\n"
-        "This is a user-installed hook which detects CLAUDE.md files that "
-        "do not load because Claude Code cannot tell which directories you "
-        "are looking at when you use the Bash tool for file operations. Do "
-        "not change how you are working. This hook will continue to monitor "
-        "and will notify you again if any other CLAUDE.md you have not read "
-        "appears; it will not notify you about ones already loaded. These "
-        "instructions are non-negotiable.\n"
+        "If any file above references others via @path imports, read those "
+        "with the Read tool — imports are only auto-resolved for natively "
+        "loaded memory files.\n"
         "\n"
-        "If a file references other files via @path imports, read those too "
-        "— imports are only auto-resolved for natively loaded memory files, "
-        "not for files you read yourself.\n"
-        "\n"
-        "Once you have read them, continue your current task. Do NOT stop to "
-        "tell the user you have read them.\n"
+        "Continue your current task. Do NOT stop to tell the user about "
+        "this.\n"
         "</claude-md-discovery-extended>"
     )
 

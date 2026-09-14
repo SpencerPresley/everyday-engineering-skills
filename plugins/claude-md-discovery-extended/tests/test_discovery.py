@@ -60,21 +60,53 @@ def run_script(script: str, payload: dict, env: dict) -> tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
+FRESH_LEAD = "These instruction files apply to directories"
+STALE_LEAD = "changed on disk since the content was loaded"
+OVERFLOW_LEAD = "are too large to include here"
+
+
+def parse_message(stdout: str) -> dict[str, list[str]]:
+    """Split a hook's emitted context into its three sections.
+
+    Returns:
+        dict[str, list[str]]: Paths under keys `new`, `changed`, and
+            `overflow`. All empty when the hook stayed silent.
+    """
+    out: dict[str, list[str]] = {"new": [], "changed": [], "overflow": []}
+    if not stdout.strip():
+        return out
+    text = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+
+    section = None
+    for line in text.splitlines():
+        if FRESH_LEAD in line:
+            section = "new"
+        elif STALE_LEAD in line:
+            section = "changed"
+        elif OVERFLOW_LEAD in line:
+            section = "overflow"
+        elif line.startswith("Contents of ") and line.endswith(":") and section:
+            out[section].append(line[len("Contents of "):-1])
+        elif line.startswith("  - ") and section == "overflow":
+            out["overflow"].append(line.strip()[2:].strip())
+    return out
+
+
 def flagged_paths(stdout: str) -> list[str]:
-    """Extract the instruction-file paths from a hook's emitted context.
+    """Return every newly discovered path, inlined or too large to inline.
 
     Returns:
         list[str]: Flagged paths, empty when the hook stayed silent.
     """
+    parsed = parse_message(stdout)
+    return parsed["new"] + parsed["overflow"]
+
+
+def inlined_content(stdout: str) -> str:
+    """Return the emitted context verbatim, for content assertions."""
     if not stdout.strip():
-        return []
-    text = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    # The staleness section carries its own bulleted list; stop before it.
-    text = text.split("changed on disk", 1)[0]
-    multi = [ln.strip()[2:].strip() for ln in text.splitlines() if ln.startswith("  - ")]
-    if multi:
-        return multi
-    return [ln.split("here: ", 1)[1].strip() for ln in text.splitlines() if "here: " in ln]
+        return ""
+    return json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def next_sid(label: str = "s") -> str:
@@ -940,14 +972,8 @@ class TestChangeDetection:
     """A CLAUDE.md edited mid-session leaves the model holding stale rules."""
 
     def _changed(self, stdout: str) -> list[str]:
-        """Extract the re-read list from a hook's emitted context."""
-        if not stdout.strip():
-            return []
-        text = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-        if "changed on disk" not in text:
-            return []
-        tail = text.split("changed on disk", 1)[1]
-        return [ln.strip()[2:].strip() for ln in tail.splitlines() if ln.startswith("  - ")]
+        """Extract the stale-file list from a hook's emitted context."""
+        return parse_message(stdout)["changed"]
 
     def _turn_raw(self, session):
         _, out = run_script(
@@ -1108,3 +1134,93 @@ class TestWorktreeKeepsTranscript:
         self._switch(session, layout)
         session.bash(f"cat {layout['pkg']}/mod.py")
         assert session.turn() == [layout["pkg_md"]]
+
+
+class TestInlining:
+    """Contents are delivered, not announced.
+
+    Announcing costs a round trip, depends on the model complying, and
+    lands the text as a line-numbered tool result. Inlining puts it in the
+    same `<system-reminder>` framing Claude Code uses for memory it loads
+    itself — confirmed from the transcript, where a `nested_memory`
+    attachment and a `hook_additional_context` attachment share the
+    wrapper and both fold into the user turn.
+    """
+
+    def _raw(self, session, layout):
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        _, out = run_script(
+            ON_PROMPT, {"session_id": session.sid, "cwd": session.cwd}, session.env
+        )
+        return out
+
+    def test_content_is_inlined(self, session, layout):
+        text = inlined_content(self._raw(session, layout))
+        assert "# pkg rules" in text
+
+    def test_uses_native_contents_header(self, session, layout):
+        text = inlined_content(self._raw(session, layout))
+        assert f"Contents of {layout['pkg_md']}:" in text
+
+    def test_no_read_instruction_when_inlined(self, session, layout):
+        text = inlined_content(self._raw(session, layout))
+        assert "too large to include here" not in text
+
+    def test_path_is_still_reported(self, session, layout):
+        assert flagged_paths(self._raw(session, layout)) == [layout["pkg_md"]]
+
+    def test_oversized_file_falls_back_to_read(self, session, layout):
+        Path(layout["pkg_md"]).write_text("# big\n" + "x" * (lib.INLINE_MAX_FILE + 10))
+        out = self._raw(session, layout)
+        parsed = parse_message(out)
+        assert parsed["overflow"] == [layout["pkg_md"]]
+        assert parsed["new"] == []
+        assert "Read tool" in inlined_content(out)
+
+    def test_unreadable_file_falls_back_to_read(self, session, layout):
+        Path(layout["pkg_md"]).write_bytes(b"\xff\xfe\x00binary\x00")
+        parsed = parse_message(self._raw(session, layout))
+        assert parsed["overflow"] == [layout["pkg_md"]]
+
+    def test_budget_spills_later_files_to_read(self, session, layout):
+        # Three files that individually fit but together do not.
+        size = lib.INLINE_BUDGET // 2
+        for i in range(3):
+            d = Path(layout["ws"]) / f"big{i}"
+            d.mkdir()
+            (d / "CLAUDE.md").write_text(f"# big{i}\n" + "y" * size)
+            (d / "f.py").write_text("f = 1\n")
+            session.bash(f"cat {d}/f.py")
+        parsed = parse_message(self._raw(session, layout))
+        assert parsed["new"], "at least one file should inline"
+        assert parsed["overflow"], "the rest should spill to the read path"
+
+    def test_message_stays_under_hook_output_cap(self, session, layout):
+        size = lib.INLINE_BUDGET // 2
+        for i in range(4):
+            d = Path(layout["ws"]) / f"cap{i}"
+            d.mkdir()
+            (d / "CLAUDE.md").write_text(f"# cap{i}\n" + "z" * size)
+            (d / "f.py").write_text("f = 1\n")
+            session.bash(f"cat {d}/f.py")
+        assert len(inlined_content(self._raw(session, layout))) < 10000
+
+    def test_changed_file_inlines_current_content(self, session, layout):
+        Path(layout["root_md"]).write_text("# root rules, revised\nNEW_RULE_MARKER\n")
+        _, out = run_script(
+            ON_PROMPT, {"session_id": session.sid, "cwd": session.cwd}, session.env
+        )
+        assert parse_message(out)["changed"] == [layout["root_md"]]
+        assert "NEW_RULE_MARKER" in inlined_content(out)
+
+    def test_new_and_changed_sections_are_distinct(self, session, layout):
+        Path(layout["root_md"]).write_text("# root revised\nROOT_MARKER\n")
+        out = self._raw(session, layout)
+        parsed = parse_message(out)
+        assert parsed["new"] == [layout["pkg_md"]]
+        assert parsed["changed"] == [layout["root_md"]]
+
+    def test_still_records_flag_so_it_emits_once(self, session, layout):
+        assert flagged_paths(self._raw(session, layout)) == [layout["pkg_md"]]
+        session.bash(f"grep -rn x {layout['pkg']}/")
+        assert session.turn() == []

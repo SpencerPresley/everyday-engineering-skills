@@ -46,7 +46,23 @@ This is best-effort by construction, and the failure modes are asymmetric on pur
 
 The window is 3s, sized against `nested_traversal` latency (0.033s–1.413s observed), which is the only load reason that can fire for a file this plugin would flag. It only delays: the turn-boundary backstop forces everything pending, so nothing is dropped.
 
-So a Bash touch records a *suspicion*, and suspicions are only emitted once they outlive a grace window (`PostToolBatch`) or at a turn boundary where every async load has certainly landed (`UserPromptSubmit`). Findings arrive as `additionalContext` — `PostToolUse`-family exit code 2 isn't honored, and nothing here should block anything.
+So a Bash touch records a *suspicion*, and suspicions are only emitted once they outlive a grace window (`PostToolBatch`) or at a turn boundary where every async load has certainly landed (`UserPromptSubmit`). Nothing blocks: `PostToolUse`-family exit code 2 isn't honored anyway, so findings go out as `additionalContext`.
+
+### Contents are delivered, not announced
+
+The plugin inlines the instruction file rather than telling Claude to go read it. That choice comes from the transcript format. A natively loaded memory file arrives as:
+
+```json
+{ "type": "attachment",
+  "attachment": { "type": "nested_memory", "path": ".../CLAUDE.md" },
+  "rendered": [{ "content": "<system-reminder>\nContents of .../CLAUDE.md:\n\n...\n</system-reminder>" }] }
+```
+
+and hook `additionalContext` arrives as the *same class of record* — `attachment.type: "hook_additional_context"`, wrapped in the same `<system-reminder>`, folded into the same user turn. So inlining reaches the model in the framing it already associates with project instructions, while a `Read` would deliver it as a line-numbered tool result. Inlining also costs no round trip and doesn't depend on Claude complying.
+
+Files over 6,000 characters fall back to the announcement, because hook output is capped at 10,000 characters — past that Claude Code spills it to a file and substitutes a preview, which would defeat the point. The whole message is budgeted to stay under the cap, spilling later findings to the read-it-yourself list rather than truncating.
+
+Each finding is emitted once per agent per context window: re-emission is gated on `(path, agent)`, identical content at other paths is suppressed by hash, and the gate is only released where the content genuinely leaves context — compaction and `/clear`.
 
 ### Deduplication by content
 
@@ -97,7 +113,7 @@ Abandoned state is garbage-collected after 30 days.
 - **Bash extraction is best-effort.** Paths that never appear as command tokens aren't seen: shell variables (`cat "$DIR/x.py"` is invisible), `xargs`/`find` pipelines, and files named only in a command's *output*. `cd` is covered separately by `CwdChanged`.
 - **`Grep` content matches.** A search rooted in one directory that returns hits deep elsewhere doesn't flag those directories until something actually touches them.
 - **Managed-policy `CLAUDE.md` is untested.** The docs list `memory_type: "Managed"` and the plugin handles it like any other load, but the probe didn't write to the machine-wide policy path to confirm it.
-- **Flagged files don't expand `@path` imports.** Claude Code only auto-resolves imports for files it loads natively, so the message tells Claude to follow them itself.
+- **Inlined files don't expand `@path` imports.** Claude Code only auto-resolves imports for files it loads natively, so the message tells Claude to follow them with the Read tool.
 
 ## Requirements
 
