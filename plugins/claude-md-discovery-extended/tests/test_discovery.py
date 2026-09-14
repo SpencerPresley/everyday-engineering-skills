@@ -996,3 +996,76 @@ class TestChangeDetection:
         out = self._turn_raw(session)
         assert flagged_paths(out) == [layout["pkg_md"]]
         assert self._changed(out) == [layout["root_md"]]
+
+
+class TestDirectAccess:
+    """Reading a CLAUDE.md yourself must not earn you a nag to read it again.
+
+    Claude Code suppresses its native memory load when the file being read
+    *is* the memory file, so no `InstructionsLoaded` arrives and the plugin
+    has to notice the read itself. Verified live: a full Read of a
+    CLAUDE.md produced no load event, and the directory was then flagged on
+    the next Bash touch.
+    """
+
+    def test_read_of_claude_md_suppresses_later_flag(self, session, layout):
+        session.tools([read_call(layout["pkg_md"])])
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert session.turn() == []
+
+    def test_partial_read_does_not_suppress(self, session, layout):
+        # A `limit=1` read returns one line and loads nothing else, so the
+        # model does not actually have the rules.
+        session.tools([{"tool_name": "Read",
+                        "tool_input": {"file_path": layout["pkg_md"], "limit": 1}}])
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert session.turn() == [layout["pkg_md"]]
+
+    def test_offset_read_does_not_suppress(self, session, layout):
+        session.tools([{"tool_name": "Read",
+                        "tool_input": {"file_path": layout["pkg_md"], "offset": 2}}])
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert session.turn() == [layout["pkg_md"]]
+
+    def test_write_of_new_claude_md_suppresses(self, session, layout):
+        target = Path(layout["plain"]) / "CLAUDE.md"
+        target.write_text("# freshly authored\n")
+        session.tools([{"tool_name": "Write",
+                        "tool_input": {"file_path": str(target)}}])
+        session.bash(f"cat {layout['plain']}/plain.py")
+        assert session.turn() == []
+
+    def test_read_is_scoped_to_the_reading_agent(self, session, layout):
+        session.tools([read_call(layout["pkg_md"])], agent="sub-r")
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert session.turn() == [layout["pkg_md"]]
+
+    def test_read_of_non_instruction_file_does_not_suppress(self, session, layout):
+        session.tools([read_call(f"{layout['pkg']}/mod.py")])
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert session.turn() == [layout["pkg_md"]]
+
+    def test_direct_read_is_dropped_on_compaction(self, session, layout):
+        # The copy lived only in the transcript, which compaction drops.
+        session.tools([read_call(layout["pkg_md"])])
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert session.turn() == []
+        session.start(source="compact")
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert session.turn() == [layout["pkg_md"]]
+
+
+class TestPseudoFilesystems:
+    """Redirects to /dev/null must not register as directory touches."""
+
+    @pytest.mark.parametrize("command", [
+        "grep -rn x pkg/ 2>/dev/null",
+        "find . -name '*.py' 2>/dev/null",
+        "cat /dev/null",
+    ])
+    def test_dev_null_is_not_a_candidate(self, layout, command):
+        assert "/dev" not in lib.bash_directories(command, layout["project"])
+
+    def test_real_path_still_found_alongside_dev_null(self, layout):
+        found = lib.bash_directories("grep -rn x pkg/ 2>/dev/null", layout["project"])
+        assert found == [layout["pkg"]]

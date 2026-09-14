@@ -11,7 +11,7 @@
       "name": "claude-md-discovery-extended",
       "source": "./plugins/claude-md-discovery-extended",
       "description": "Flags CLAUDE.md files that never reached the context window. Claude Code loads a nested CLAUDE.md only when a file tool reaches its directory, so Bash operations bypass it silently; this tracks what was actually loaded and surfaces the gap.",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "keywords": [
         "claude-md",
         "agents-md",

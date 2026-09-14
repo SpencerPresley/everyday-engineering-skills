@@ -50,15 +50,31 @@ GLOBAL_LOAD_REASONS = frozenset({"session_start", "compact"})
 
 MAIN_AGENT = ""
 
-# Observed InstructionsLoaded latency in probe sessions ranged from 0.03s
-# to 4.54s, and an event landed 24ms *after* the PostToolBatch for the
-# batch that caused it. A suspicion younger than this is not emitted, or
-# a Bash call touching the same directory as a concurrent Read would nag
-# about a file Claude Code is in the middle of loading anyway.
-GRACE_SECS = 10.0
+# Guards exactly one race: a batch containing both a Read of pkg/mod.py
+# (which makes Claude Code load pkg/CLAUDE.md) and a Bash call touching
+# pkg/. The Bash raises a suspicion while the Read's InstructionsLoaded is
+# still in flight — one was measured landing 24ms *after* the
+# PostToolBatch for its own batch. Emitting immediately would tell the
+# model to read a file Claude Code is already loading.
+#
+# Sized against nested_traversal latency only (0.033, 0.035, 0.038, 0.520,
+# 1.413s across probe sessions), which is the only reason an event can
+# arrive for a file this plugin would flag. A 4.54s path_glob_match was
+# also observed but is irrelevant: rules files live in .claude/rules/ and
+# `candidate_files` never looks there, so a slow rules load cannot produce
+# a false nag.
+#
+# This only delays — the UserPromptSubmit backstop forces every pending
+# suspicion at the turn boundary, so nothing is ever dropped.
+GRACE_SECS = 3.0
 
 WALK_MAX_DEPTH = 25
 BASH_MAX_CANDIDATES = 20
+
+# `2>/dev/null` and friends appear in a large share of commands and always
+# resolve to a real directory, so they would otherwise be suspected on
+# nearly every call.
+BASH_SKIP_PREFIXES = ("/dev/", "/proc/", "/sys/")
 TRIG_MAX = 400
 SUSP_MAX = 200
 
@@ -682,6 +698,8 @@ def bash_directories(command: str, cwd: str) -> list[str]:
             continue
         if token.startswith("~"):
             token = os.path.expanduser(token)
+        if token.startswith(BASH_SKIP_PREFIXES):
+            continue
         if not token.startswith("/"):
             if "/" not in token and "." not in token:
                 # Bare words are overwhelmingly subcommands and operands,

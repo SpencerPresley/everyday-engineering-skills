@@ -41,6 +41,50 @@ WORKTREE_TOOLS = {"EnterWorktree", "ExitWorktree"}
 WRITE_TOOLS = {"Write", "Edit", "NotebookEdit"}
 
 
+def mark_direct_access(
+    state: State, tool_name: str, tool_input: dict, file_path: str, agent: str
+) -> None:
+    """Record an instruction file whose content the model just saw or wrote.
+
+    Reading a CLAUDE.md with the Read tool puts its content in the
+    transcript but fires no `InstructionsLoaded` — Claude Code suppresses
+    its native memory load when the file being read *is* the memory file.
+    Without this, a later Bash touch of that directory would tell the
+    model to read a file it already read, putting a second copy in
+    context.
+
+    Recorded as a flag rather than a load, because that is what it is:
+    transcript-carried, scoped to the agent that saw it, and dropped on
+    compaction. A partial read does not count — a `limit=1` read returns
+    one line and loads nothing else.
+
+    Args:
+        state (State): The session state.
+        tool_name (str): The tool that touched the file.
+        tool_input (dict): Its input payload.
+        file_path (str): The instruction file's path as the tool saw it.
+        agent (str): The `agent_id` that ran the tool.
+    """
+    if tool_name == "Read":
+        if tool_input.get("offset") or tool_input.get("limit"):
+            return
+    elif tool_name not in WRITE_TOOLS:
+        return
+
+    path = canon(file_path)
+    content_hash = hash_file(path)
+    if not content_hash:
+        return
+
+    meta = state.loads.get(path)
+    if meta:
+        # Already natively loaded; just keep the hash current so the
+        # staleness check does not nag about an edit the model made.
+        state.record_load(path, content_hash, meta["r"], meta["g"])
+    else:
+        state.record_flag(path, content_hash, agent)
+
+
 def observe(state: State, tool_calls: list, cwd: str, agent: str) -> None:
     """Index triggers and raise suspicions for one batch of tool calls.
 
@@ -58,24 +102,14 @@ def observe(state: State, tool_calls: list, cwd: str, agent: str) -> None:
         if not isinstance(tool_input, dict):
             continue
 
+        tool_name = call.get("tool_name")
         file_path = tool_input.get("file_path")
         if isinstance(file_path, str):
             state.note_trigger(file_path, agent)
-            if (
-                call.get("tool_name") in WRITE_TOOLS
-                and os.path.basename(file_path) in memory_basenames()
-            ):
-                # The model just wrote this file, so the new content is
-                # already in its context. Refresh the recorded hash or the
-                # turn-boundary staleness check would nag about an edit it
-                # made itself.
-                path = canon(file_path)
-                meta = state.loads.get(path)
-                content_hash = hash_file(path)
-                if meta and content_hash:
-                    state.record_load(path, content_hash, meta["r"], meta["g"])
+            if os.path.basename(file_path) in memory_basenames():
+                mark_direct_access(state, tool_name, tool_input, file_path, agent)
 
-        if call.get("tool_name") != "Bash":
+        if tool_name != "Bash":
             continue
         command = tool_input.get("command")
         if not isinstance(command, str):

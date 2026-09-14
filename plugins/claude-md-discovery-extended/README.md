@@ -25,9 +25,13 @@ The [`InstructionsLoaded`](https://code.claude.com/docs/en/hooks#instructionsloa
 
 This covers things a hand-rolled ancestor walk gets wrong: `.claude/rules/*.md` (including `paths:`-scoped rules, which arrive as `path_glob_match`), `CLAUDE.local.md`, `.claude/CLAUDE.md`, `@path` import expansion, managed-policy files, and the re-injection that follows compaction.
 
+There is one blind spot, and the plugin handles it separately. Reading a `CLAUDE.md` **with the Read tool** fires no event: Claude Code suppresses its native memory load when the file being read *is* the memory file, so the content reaches the transcript without a load. The plugin therefore records direct reads itself — as a flag, not a load, since that is what it is: transcript-carried, scoped to the agent that read it, and dropped on compaction. Without this, reading a `CLAUDE.md` and then touching its directory with Bash would tell you to read a file you just read, putting a second copy in context.
+
+A **partial** read (`offset`/`limit`) doesn't count. It returns the requested lines and loads nothing else, so the model doesn't actually have the rules — reading line 1 to "trigger" the loader does not work.
+
 ### Bash directories are the only guess
 
-For a `Bash` call, the plugin tokenizes the command and keeps tokens that resolve to something on disk — absolute, `~`-prefixed, or **relative to the session's working directory**. Everything else (flags, `sed` scripts, bare subcommands, heredoc text) falls away because it doesn't resolve.
+For a `Bash` call, the plugin tokenizes the command and keeps tokens that resolve to something on disk — absolute, `~`-prefixed, or **relative to the session's working directory**. Everything else (flags, `sed` scripts, bare subcommands, heredoc text) falls away because it doesn't resolve. Redirect targets under `/dev`, `/proc`, and `/sys` are dropped explicitly: `2>/dev/null` appears in a large share of commands and always resolves.
 
 This is best-effort by construction, and the failure modes are asymmetric on purpose:
 
@@ -38,7 +42,9 @@ This is best-effort by construction, and the failure modes are asymmetric on pur
 
 ### Nothing is emitted synchronously
 
-`InstructionsLoaded` is asynchronous. Measured latencies ranged from 0.03s to 4.5s, and one event arrived **24ms after the `PostToolBatch` for the very batch that caused it**. A `Bash` call touching the same directory as a `Read` in the same batch would therefore be flagged while Claude Code was still loading the file.
+`InstructionsLoaded` is asynchronous, and one event was measured arriving **24ms after the `PostToolBatch` for the very batch that caused it**. So a batch holding both a `Read` of `pkg/mod.py` and a `Bash` call touching `pkg/` would flag `pkg/CLAUDE.md` while Claude Code was still loading it.
+
+The window is 3s, sized against `nested_traversal` latency (0.033s–1.413s observed), which is the only load reason that can fire for a file this plugin would flag. It only delays: the turn-boundary backstop forces everything pending, so nothing is dropped.
 
 So a Bash touch records a *suspicion*, and suspicions are only emitted once they outlive a grace window (`PostToolBatch`) or at a turn boundary where every async load has certainly landed (`UserPromptSubmit`). Findings arrive as `additionalContext` — `PostToolUse`-family exit code 2 isn't honored, and nothing here should block anything.
 
@@ -88,7 +94,7 @@ Abandoned state is garbage-collected after 30 days.
 
 ## Limitations
 
-- **Bash extraction is best-effort.** Paths that never appear as command tokens — shell variables, `xargs`/`find` pipelines, files named only in a command's *output* — aren't seen. `cd` is covered separately by `CwdChanged`.
+- **Bash extraction is best-effort.** Paths that never appear as command tokens aren't seen: shell variables (`cat "$DIR/x.py"` is invisible), `xargs`/`find` pipelines, and files named only in a command's *output*. `cd` is covered separately by `CwdChanged`.
 - **`Grep` content matches.** A search rooted in one directory that returns hits deep elsewhere doesn't flag those directories until something actually touches them.
 - **Managed-policy `CLAUDE.md` is untested.** The docs list `memory_type: "Managed"` and the plugin handles it like any other load, but the probe didn't write to the machine-wide policy path to confirm it.
 - **Flagged files don't expand `@path` imports.** Claude Code only auto-resolves imports for files it loads natively, so the message tells Claude to follow them itself.
