@@ -936,10 +936,28 @@ class TestOutputFormat:
         assert "decision" not in payload
         assert "continue" not in payload
 
-    def test_message_is_wrapped_in_tags(self, session, layout):
+    def test_starts_on_its_own_line(self, session, layout):
+        # Claude Code prefixes the payload with "<event> hook additional
+        # context:", so without a leading newline the first sentence runs
+        # on from that label.
         text = self._context(session, layout)["hookSpecificOutput"]["additionalContext"]
-        assert text.startswith("<claude-md-discovery-extended>")
-        assert text.endswith("</claude-md-discovery-extended>")
+        assert text.startswith("\n")
+        assert not text.startswith("\n\n")
+
+    def test_carries_no_wrapper_tag(self, session, layout):
+        # The payload is already inside a <system-reminder>; a second tag
+        # nested in it was only noise.
+        text = self._context(session, layout)["hookSpecificOutput"]["additionalContext"]
+        assert "<claude-md-discovery-extended>" not in text
+        assert "</claude-md-discovery-extended>" not in text
+
+    def test_uses_the_native_memory_shape(self, session, layout):
+        text = self._context(session, layout)["hookSpecificOutput"]["additionalContext"]
+        assert f"Contents of {layout['pkg_md']}:" in text
+
+    def test_names_the_plugin_for_traceability(self, session, layout):
+        text = self._context(session, layout)["hookSpecificOutput"]["additionalContext"]
+        assert "claude-md-discovery-extended" in text
 
     def test_message_names_the_read_tool(self, session, layout):
         text = self._context(session, layout)["hookSpecificOutput"]["additionalContext"]

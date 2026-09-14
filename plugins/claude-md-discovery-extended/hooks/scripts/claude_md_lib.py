@@ -1046,15 +1046,22 @@ class Delivery:
                 f"{listing}"
             )
 
+        # Leads with a newline so the text starts on its own line rather
+        # than running on from Claude Code's "<event> hook additional
+        # context:" prefix, and carries no wrapper tag of its own: the
+        # whole payload is already inside a <system-reminder>, and the
+        # "Contents of <path>:" blocks are the exact shape Claude Code
+        # uses for memory it loads itself. A second tag nested inside the
+        # reminder only added noise.
         return (
-            "<claude-md-discovery-extended>\n"
+            "\n"
             + "\n\n".join(sections)
             + "\n\n"
-            "This is a user-installed hook which detects CLAUDE.md files "
-            "that do not load, because Claude Code cannot tell which "
-            "directories you are reaching into when you use the Bash tool. "
-            "Keep working the way you were. It will surface any other "
-            "unloaded CLAUDE.md the same way.\n"
+            "These were surfaced by the claude-md-discovery-extended hook, "
+            "which catches CLAUDE.md files that never loaded because Claude "
+            "Code cannot see which directories a Bash command reaches into. "
+            "Keep working the way you were; it will surface any others the "
+            "same way.\n"
             "\n"
             "If any file above references others via @path imports, read "
             "those with the Read tool — imports are only auto-resolved for "
@@ -1062,8 +1069,7 @@ class Delivery:
             "\n"
             "Carry on with your current task rather than pausing to report "
             "this. If the user asks what instructions you have loaded, "
-            "answer honestly and include these.\n"
-            "</claude-md-discovery-extended>"
+            "answer honestly and include these."
         )
 
 

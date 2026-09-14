@@ -64,6 +64,8 @@ The plugin inlines the instruction file rather than telling Claude to go read it
 
 and hook `additionalContext` arrives as the *same class of record* — `attachment.type: "hook_additional_context"`, wrapped in the same `<system-reminder>`, folded into the same user turn. So inlining reaches the model in the framing it already associates with project instructions, while a `Read` would deliver it as a line-numbered tool result. Inlining also costs no round trip and doesn't depend on Claude complying.
 
+For the same reason the payload carries **no wrapper tag of its own** and begins with a newline. Claude Code already encloses it in `<system-reminder>` and prefixes it with `<event> hook additional context:`; a second nested tag added noise, and without the leading newline the first sentence ran on from that prefix.
+
 Files over 6,000 characters fall back to an *announcement* — the path plus an instruction to read it — because hook output is capped at 10,000 characters, past which Claude Code spills it to a file and substitutes a preview. The whole message is budgeted under that cap, spilling later findings to the announcement list rather than truncating.
 
 **Announcing is not delivering, and the ledger tracks the difference.** An inlined file's contents are in context, so it is marked known and never surfaces again. An announced file's contents are not, so it is recorded only as an announcement: it surfaces again on a later touch of that directory (rate-limited to once per five minutes) and stops only when the model is observed actually reading it. The same rule applies to a changed file too large to inline — its new hash is not committed until the new content has been delivered, so it keeps reporting rather than silently marking itself current.
