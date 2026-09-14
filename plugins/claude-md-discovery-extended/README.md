@@ -46,7 +46,11 @@ This is best-effort by construction, and the failure modes are asymmetric on pur
 
 The window is 3s, sized against `nested_traversal` latency (0.033s–1.413s observed), which is the only load reason that can fire for a file this plugin would flag. It only delays: the turn-boundary backstop forces everything pending, so nothing is dropped.
 
-So a Bash touch records a *suspicion*, and suspicions are only emitted once they outlive a grace window (`PostToolBatch`) or at a turn boundary where every async load has certainly landed (`UserPromptSubmit`). Nothing blocks: `PostToolUse`-family exit code 2 isn't honored anyway, so findings go out as `additionalContext`.
+So a Bash touch records a *suspicion*, and the plugin asks whether anything could actually be racing it. A file tool at that directory **or beneath it** puts a load in flight, because the traversal walks upward; a file tool above it cannot. Only a contended suspicion waits — an uncontended one is emitted by the very `PostToolBatch` that observed it.
+
+That distinction is what makes the plugin usable rather than merely correct. A turn is very often a single tool call followed by an answer, and a suspicion that always needed a *later* batch would never be emitted during that turn at all — it would sit until the user happened to type again. If you have to prompt the model to make the hook fire, you may as well have told it to read the file yourself.
+
+Nothing blocks: `PostToolUse`-family exit code 2 isn't honored anyway, so findings go out as `additionalContext`.
 
 ### Contents are delivered, not announced
 
@@ -78,7 +82,7 @@ A file loaded inside a subagent therefore doesn't suppress discovery for the mai
 
 ### Staleness
 
-Claude Code loads a memory file once and never reloads it, so editing a `CLAUDE.md` mid-session leaves the model working from rules it can no longer see. Every loaded file is re-hashed at each turn boundary and a change produces one re-read nudge. Edits Claude makes itself through `Write`/`Edit` don't nag — that content is already in its context.
+Claude Code loads a memory file once and never reloads it, so editing a `CLAUDE.md` mid-session leaves the model working from rules it can no longer see. Every loaded file is re-hashed on the tool path (throttled to once every 15s) and again at each turn boundary, and a change delivers the current content. Running it only at turn boundaries would have the same defect as deferred discovery: an edit made while you watch a long run of tool calls wouldn't surface until you next typed. Edits Claude makes itself through `Write`/`Edit` don't nag — that content is already in its context.
 
 ### Lifecycle
 
@@ -92,9 +96,9 @@ Claude Code loads a memory file once and never reloads it, so editing a `CLAUDE.
 | Event | Role |
 | :--- | :--- |
 | `InstructionsLoaded` | Records every file Claude Code loaded. The only writer of "in context." |
-| `PostToolBatch` | Extracts Bash directories, indexes triggers for agent attribution, emits matured findings. Once per batch, not per tool. |
+| `PostToolBatch` | Extracts Bash directories, indexes triggers and file-tool touches, emits ready findings and throttled staleness checks. Once per batch, not per tool. |
 | `CwdChanged` | Records a `cd` destination as touched. |
-| `UserPromptSubmit` | Turn-boundary flush: emits every pending finding and runs the staleness check. |
+| `UserPromptSubmit` | Turn-boundary flush: forces every pending finding, including contended ones still inside their window. |
 | `SessionStart` | Anchors the session root, handles `/clear` and compaction, garbage-collects abandoned state. |
 | `SessionEnd` | Deletes state on `/clear`; keeps it otherwise. |
 

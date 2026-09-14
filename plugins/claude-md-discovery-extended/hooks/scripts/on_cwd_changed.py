@@ -12,6 +12,7 @@ suspicion; `PostToolBatch` or `UserPromptSubmit` emits it.
 """
 
 import sys
+import time
 
 from claude_md_lib import State, canon, config_dir, ignored_prefixes, is_ignored
 from hook_runner import run
@@ -35,8 +36,12 @@ def handle(data: dict) -> None:
     if is_ignored(directory, ignored_prefixes()):
         sys.exit(0)
 
+    now = time.time()
     state = State(session_id)
-    state.suspect(directory, data.get("agent_id") or "")
+    state.suspect(
+        directory, data.get("agent_id") or "", now,
+        state.is_contended(directory, now),
+    )
     state.flush()
 
 

@@ -109,6 +109,30 @@ def inlined_content(stdout: str) -> str:
     return json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
 
 
+def collect(session, command: str, agent: str = "", cwd: str = None) -> str:
+    """Run one Bash batch and return whichever hook emitted.
+
+    An uncontended suspicion is emitted by the very batch that observed
+    it; a contended one waits and is forced at the turn boundary. Tests
+    should not care which fired unless that is what they are testing.
+
+    Returns:
+        str: Raw hook stdout, empty when nothing was emitted.
+    """
+    code, out = run_script(
+        ON_BATCH,
+        batch(session.sid, cwd or session.cwd, [bash_call(command)], agent),
+        session.env,
+    )
+    assert code == 0
+    if out.strip():
+        return out
+    _, out = run_script(
+        ON_PROMPT, {"session_id": session.sid, "cwd": session.cwd}, session.env
+    )
+    return out
+
+
 def next_sid(label: str = "s") -> str:
     """Return a session id unique within this test run."""
     global _sid_counter
@@ -283,6 +307,10 @@ def session(hook_env, layout):
             """Fire PostToolBatch with a single Bash call."""
             return self.tools([bash_call(command)], agent, cwd)
 
+        def discover(self, command, agent="", cwd=None):
+            """Run a Bash command and return whatever was surfaced."""
+            return flagged_paths(collect(self, command, agent, cwd))
+
         def turn(self):
             """Fire UserPromptSubmit, returning flagged paths."""
             code, out = run_script(
@@ -444,48 +472,39 @@ class TestDiscovery:
     """A directory reached only through Bash must surface its CLAUDE.md."""
 
     def test_bash_into_nested_dir_flags(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
     def test_bash_with_relative_path_flags(self, session, layout):
-        session.bash("cat pkg/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover("cat pkg/mod.py") == [layout["pkg_md"]]
 
     def test_walk_collects_ancestors_up_to_root(self, session, layout):
         # pkg/deep has no CLAUDE.md of its own; pkg's applies to work there.
-        session.bash(f"cat {layout['deep']}/deep.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['deep']}/deep.py") == [layout["pkg_md"]]
 
     def test_directory_without_instruction_file_is_silent(self, session, layout):
-        session.bash(f"cat {layout['plain']}/plain.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['plain']}/plain.py") == []
 
     def test_outside_project_tree_flags(self, session, layout):
-        session.bash(f"cat {layout['sibling']}/sib.py")
-        assert session.turn() == [layout["sibling_md"]]
+        assert session.discover(f"cat {layout['sibling']}/sib.py") == [layout["sibling_md"]]
 
     def test_loaded_root_is_never_reflagged(self, session, layout):
         session.bash(f"cat {layout['pkg']}/mod.py")
         assert layout["root_md"] not in session.turn()
 
     def test_second_touch_is_silent(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
-        session.bash(f"grep -rn x {layout['pkg']}/")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
+        assert session.discover(f"grep -rn x {layout['pkg']}/") == []
 
     def test_agents_md_flagged_when_no_claude_md(self, session, layout, tmp_path):
         other = Path(layout["ws"]) / "agentsonly"
         other.mkdir()
         (other / "AGENTS.md").write_text("# agents\n")
         (other / "a.py").write_text("a = 1\n")
-        session.bash(f"cat {other}/a.py")
-        assert session.turn() == [os.path.realpath(other / "AGENTS.md")]
+        assert session.discover(f"cat {other}/a.py") == [os.path.realpath(other / "AGENTS.md")]
 
     def test_agents_md_skipped_beside_claude_md(self, session, layout):
         (Path(layout["pkg"]) / "AGENTS.md").write_text("# agents\n")
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
     def test_agents_md_disabled_by_env(self, session, layout):
         other = Path(layout["ws"]) / "agentsonly2"
@@ -493,37 +512,48 @@ class TestDiscovery:
         (other / "AGENTS.md").write_text("# agents\n")
         (other / "a.py").write_text("a = 1\n")
         session.env["CLAUDE_MD_DISCOVERY_AGENTS_MD"] = "0"
-        session.bash(f"cat {other}/a.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {other}/a.py") == []
 
     def test_claude_local_md_flagged(self, session, layout):
         local = Path(layout["pkg"]) / "CLAUDE.local.md"
         local.write_text("# local pkg rules\n")
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert sorted(session.turn()) == sorted(
+        assert sorted(session.discover(f"cat {layout['pkg']}/mod.py")) == sorted(
             [layout["pkg_md"], os.path.realpath(local)]
         )
 
 
 class TestGraceWindow:
-    """Emission must outlive the async InstructionsLoaded event."""
+    """Emission waits only when a load for that directory may be in flight.
 
-    def test_batch_stays_silent_inside_grace_window(self, session, layout):
-        assert session.bash(f"cat {layout['pkg']}/mod.py") == []
+    The window guards one race: a file tool and a Bash call reaching the
+    same directory close together, where the file tool's
+    InstructionsLoaded is still pending. When nothing could produce such
+    an event, waiting is pure cost — and worse than cost, because a turn
+    is often a single tool call followed by an answer, so a suspicion that
+    needed a *later* batch would sit unemitted until the user typed again.
+    """
 
-    def test_batch_emits_once_grace_elapsed(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
+    def test_uncontended_batch_emits_immediately(self, session, layout):
+        assert session.bash(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
+
+    def test_contended_batch_stays_silent(self, session, layout):
+        # A Read in the same batch makes Claude Code load pkg/CLAUDE.md;
+        # its event may land after this hook returns.
+        assert session.tools([
+            read_call(f"{layout['pkg']}/mod.py"),
+            bash_call(f"wc -l {layout['pkg']}/mod.py"),
+        ]) == []
+
+    def test_contended_suspicion_emits_once_grace_elapses(self, session, layout):
+        session.tools([
+            read_call(f"{layout['pkg']}/mod.py"),
+            bash_call(f"wc -l {layout['pkg']}/mod.py"),
+        ])
         age_suspicions(session.env, session.sid, lib.GRACE_SECS + 1)
         assert session.tools([bash_call("echo unrelated")]) == [layout["pkg_md"]]
 
-    def test_turn_boundary_forces_emission(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
-
     def test_late_load_within_window_suppresses(self, session, layout):
-        # The case the grace window exists for: a Read and a Bash touch the
-        # same directory in one batch, and the Read's InstructionsLoaded
-        # event lands after PostToolBatch has already run.
+        # The whole reason the window exists.
         assert session.tools([
             read_call(f"{layout['pkg']}/mod.py"),
             bash_call(f"wc -l {layout['pkg']}/mod.py"),
@@ -532,16 +562,41 @@ class TestGraceWindow:
                        trigger=f"{layout['pkg']}/mod.py")
         assert session.turn() == []
 
-    def test_suspicion_survives_across_batches(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.tools([bash_call("echo one")]) == []
-        age_suspicions(session.env, session.sid, lib.GRACE_SECS + 1)
-        assert session.tools([bash_call("echo two")]) == [layout["pkg_md"]]
+    def test_read_below_the_directory_also_contends(self, session, layout):
+        # Reading pkg/deep/deep.py loads pkg/CLAUDE.md too, since the
+        # traversal walks upward.
+        assert session.tools([
+            read_call(f"{layout['deep']}/deep.py"),
+            bash_call(f"wc -l {layout['pkg']}/mod.py"),
+        ]) == []
+
+    def test_read_above_the_directory_does_not_contend(self, session, layout):
+        # Reading a file in the project root cannot produce a load for
+        # pkg/CLAUDE.md, so there is nothing to wait for.
+        (Path(layout["project"]) / "top.py").write_text("t = 1\n")
+        assert session.tools([
+            read_call(f"{layout['project']}/top.py"),
+            bash_call(f"wc -l {layout['pkg']}/mod.py"),
+        ]) == [layout["pkg_md"]]
+
+    def test_contention_persists_across_batches(self, session, layout):
+        session.tools([read_call(f"{layout['pkg']}/mod.py")])
+        assert session.bash(f"wc -l {layout['pkg']}/mod.py") == []
+
+    def test_turn_boundary_forces_emission(self, session, layout):
+        session.tools([
+            read_call(f"{layout['pkg']}/mod.py"),
+            bash_call(f"wc -l {layout['pkg']}/mod.py"),
+        ])
+        assert session.turn() == [layout["pkg_md"]]
 
     def test_duplicate_suspicion_not_queued_twice(self, session, layout):
+        session.tools([read_call(f"{layout['pkg']}/mod.py")])
         session.bash(f"cat {layout['pkg']}/mod.py")
         session.bash(f"head -1 {layout['pkg']}/mod.py")
-        pending = json.loads(state_file(session.env, session.sid, ".pending.json").read_text())
+        pending = json.loads(
+            state_file(session.env, session.sid, ".pending.json").read_text()
+        )
         assert len(pending["susp"]) == 1
 
 
@@ -551,8 +606,7 @@ class TestSuppression:
     def test_natively_loaded_nested_file_not_flagged(self, session, layout):
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == []
 
     def test_path_glob_match_load_suppresses(self, session, layout):
         rules = Path(layout["project"]) / ".claude" / "rules"
@@ -573,8 +627,7 @@ class TestSuppression:
         (twin / "t.py").write_text("t = 1\n")
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
-        session.bash(f"cat {twin}/t.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {twin}/t.py") == []
 
     def test_diverged_copy_still_flags(self, session, layout):
         twin = Path(layout["ws"]) / "twin2"
@@ -583,8 +636,7 @@ class TestSuppression:
         (twin / "t.py").write_text("t = 1\n")
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
-        session.bash(f"cat {twin}/t.py")
-        assert session.turn() == [os.path.realpath(twin / "CLAUDE.md")]
+        assert session.discover(f"cat {twin}/t.py") == [os.path.realpath(twin / "CLAUDE.md")]
 
     def test_unloaded_on_disk_copy_does_not_suppress(self, session, layout):
         # Pre-0.5 a project scan recorded every CLAUDE.md on disk as
@@ -594,8 +646,9 @@ class TestSuppression:
         twin.mkdir()
         (twin / "CLAUDE.md").write_text(Path(layout["pkg_md"]).read_text())
         (twin / "t.py").write_text("t = 1\n")
-        session.bash(f"cat {twin}/t.py")
-        assert os.path.realpath(twin / "CLAUDE.md") in session.turn()
+        assert os.path.realpath(twin / "CLAUDE.md") in session.discover(
+            f"cat {twin}/t.py"
+        )
 
     def test_suppression_is_logged_with_match(self, session, layout):
         twin = Path(layout["ws"]) / "twin4"
@@ -616,28 +669,24 @@ class TestSuppression:
         link.symlink_to(layout["pkg"])
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
-        session.bash(f"cat {link}/mod.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {link}/mod.py") == []
 
 
 class TestAgentScoping:
     """A subagent's context is not the main agent's."""
 
     def test_subagent_touch_flags_for_subagent(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py", agent="sub-1")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py", agent="sub-1") == [layout["pkg_md"]]
 
     def test_subagent_flag_does_not_suppress_main(self, session, layout):
         session.bash(f"cat {layout['pkg']}/mod.py", agent="sub-1")
         session.turn()
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
     def test_main_flag_does_not_suppress_subagent(self, session, layout):
         session.bash(f"cat {layout['pkg']}/mod.py")
         session.turn()
-        session.bash(f"cat {layout['pkg']}/mod.py", agent="sub-2")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py", agent="sub-2") == [layout["pkg_md"]]
 
     def test_subagent_triggered_load_attributed_via_trigger_index(self, session, layout):
         # InstructionsLoaded carries no agent_id; attribution is recovered
@@ -645,15 +694,13 @@ class TestAgentScoping:
         session.tools([read_call(f"{layout['pkg']}/mod.py")], agent="sub-3")
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
-        session.bash(f"cat {layout['pkg']}/mod.py", agent="sub-3")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py", agent="sub-3") == []
 
     def test_subagent_load_does_not_suppress_for_main(self, session, layout):
         session.tools([read_call(f"{layout['pkg']}/mod.py")], agent="sub-4")
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
     def test_session_start_loads_are_visible_to_subagents(self, session, layout):
         session.bash(f"cat {layout['pkg']}/mod.py", agent="sub-5")
@@ -712,8 +759,7 @@ class TestWorktree:
         session.tools([{"tool_name": "EnterWorktree", "tool_input": {"name": "wt"}}],
                       cwd=str(wt))
         session.cwd = os.path.realpath(wt)
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert layout["pkg_md"] in session.turn()
+        assert layout["pkg_md"] in session.discover(f"cat {layout['pkg']}/mod.py")
 
     def test_enter_worktree_keeps_session_start_loads(self, session, layout):
         wt = self._worktree(layout)
@@ -742,8 +788,7 @@ class TestWorktree:
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
         session.tools([{"tool_name": "ExitWorktree", "tool_input": {"action": "keep"}}])
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == []
 
 
 class TestLifecycle:
@@ -754,22 +799,18 @@ class TestLifecycle:
         session.turn()
         session.start(source="clear")
         session.loaded(layout["root_md"])
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
     def test_compact_drops_flags_keeps_loads(self, session, layout):
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
         outside = Path(layout["sibling"])
-        session.bash(f"cat {outside}/sib.py")
-        assert session.turn() == [layout["sibling_md"]]
+        assert session.discover(f"cat {outside}/sib.py") == [layout["sibling_md"]]
         session.start(source="compact")
         # The flagged file lived only in the transcript, so it re-flags.
-        session.bash(f"cat {outside}/sib.py")
-        assert session.turn() == [layout["sibling_md"]]
+        assert session.discover(f"cat {outside}/sib.py") == [layout["sibling_md"]]
         # The natively loaded one did not.
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == []
 
     def test_compact_drop_is_logged(self, session, layout):
         session.bash(f"cat {layout['sibling']}/sib.py")
@@ -781,8 +822,7 @@ class TestLifecycle:
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
         session.start(source="resume")
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == []
 
     def test_session_end_clear_deletes_state(self, session, layout):
         session.bash(f"cat {layout['pkg']}/mod.py")
@@ -825,8 +865,6 @@ class TestLifecycle:
             hook_env,
         )
         assert code == 0
-        _, out = run_script(ON_PROMPT, {"session_id": sid, "cwd": layout["project"]},
-                            hook_env)
         assert flagged_paths(out) == [layout["pkg_md"]]
 
 
@@ -835,27 +873,23 @@ class TestIgnoreList:
 
     def test_ignored_prefix_never_flags(self, session, layout):
         session.env["CLAUDE_MD_DISCOVERY_IGNORE"] = layout["sibling"]
-        session.bash(f"cat {layout['sibling']}/sib.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['sibling']}/sib.py") == []
 
     def test_multiple_prefixes(self, session, layout):
         session.env["CLAUDE_MD_DISCOVERY_IGNORE"] = os.pathsep.join(
             [layout["sibling"], layout["pkg"]]
         )
         session.bash(f"cat {layout['sibling']}/sib.py")
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == []
 
     def test_root_prefix_is_kill_switch(self, session, layout):
         session.env["CLAUDE_MD_DISCOVERY_IGNORE"] = "/"
         session.bash(f"cat {layout['pkg']}/mod.py")
-        session.bash(f"cat {layout['sibling']}/sib.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['sibling']}/sib.py") == []
 
     def test_unignored_sibling_still_flags(self, session, layout):
         session.env["CLAUDE_MD_DISCOVERY_IGNORE"] = layout["plain"]
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
 
 class TestConfigDirExclusion:
@@ -865,16 +899,14 @@ class TestConfigDirExclusion:
         config = Path(hook_env["CLAUDE_CONFIG_DIR"])
         (config / "CLAUDE.md").write_text("# global user memory\n")
         (config / "notes.txt").write_text("x\n")
-        session.bash(f"cat {config}/notes.txt")
-        assert session.turn() == []
+        assert session.discover(f"cat {config}/notes.txt") == []
 
     def test_plugin_claude_md_under_config_not_flagged(self, session, hook_env):
         plugin = Path(hook_env["CLAUDE_CONFIG_DIR"]) / "plugins" / "somewhere"
         plugin.mkdir(parents=True)
         (plugin / "CLAUDE.md").write_text("# plugin rules\n")
         (plugin / "code.py").write_text("x = 1\n")
-        session.bash(f"cat {plugin}/code.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {plugin}/code.py") == []
 
     def test_cd_into_config_dir_not_flagged(self, session, hook_env):
         config = Path(hook_env["CLAUDE_CONFIG_DIR"])
@@ -883,23 +915,20 @@ class TestConfigDirExclusion:
         assert session.turn() == []
 
     def test_sibling_still_flags_with_config_dir_set(self, session, layout):
-        session.bash(f"cat {layout['sibling']}/sib.py")
-        assert session.turn() == [layout["sibling_md"]]
+        assert session.discover(f"cat {layout['sibling']}/sib.py") == [layout["sibling_md"]]
 
 
 class TestOutputFormat:
     """Findings are delivered as additionalContext, never as a block."""
 
     def _context(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        _, out = run_script(
-            ON_PROMPT, {"session_id": session.sid, "cwd": session.cwd}, session.env
-        )
-        return json.loads(out)
+        return json.loads(collect(session, f"cat {layout['pkg']}/mod.py"))
 
     def test_uses_hook_specific_output(self, session, layout):
         payload = self._context(session, layout)
-        assert payload["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+        assert payload["hookSpecificOutput"]["hookEventName"] in (
+            "PostToolBatch", "UserPromptSubmit"
+        )
         assert "additionalContext" in payload["hookSpecificOutput"]
 
     def test_does_not_block(self, session, layout):
@@ -921,24 +950,39 @@ class TestOutputFormat:
         assert "@path" in text
 
     def test_batch_output_names_its_own_event(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        age_suspicions(session.env, session.sid, lib.GRACE_SECS + 1)
         _, out = run_script(
-            ON_BATCH, batch(session.sid, session.cwd, [bash_call("echo x")]),
+            ON_BATCH,
+            batch(session.sid, session.cwd,
+                  [bash_call(f"cat {layout['pkg']}/mod.py")]),
             session.env,
         )
         assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolBatch"
 
+    def test_turn_output_names_its_own_event(self, session, layout):
+        session.tools([
+            read_call(f"{layout['pkg']}/mod.py"),
+            bash_call(f"wc -l {layout['pkg']}/mod.py"),
+        ])
+        _, out = run_script(
+            ON_PROMPT, {"session_id": session.sid, "cwd": session.cwd}, session.env
+        )
+        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+
     def test_single_and_multiple_forms_both_parse(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert len(session.turn()) == 1
-        session.bash(f"cat {layout['sibling']}/sib.py")
+        assert len(session.discover(f"cat {layout['pkg']}/mod.py")) == 1
         other = Path(layout["ws"]) / "third"
         other.mkdir()
         (other / "CLAUDE.md").write_text("# third\n")
         (other / "t.py").write_text("t = 1\n")
-        session.bash(f"cat {other}/t.py")
-        assert len(session.turn()) == 2
+        _, out = run_script(
+            ON_BATCH,
+            batch(session.sid, session.cwd, [
+                bash_call(f"cat {layout['sibling']}/sib.py"),
+                bash_call(f"cat {other}/t.py"),
+            ]),
+            session.env,
+        )
+        assert len(flagged_paths(out)) == 2
 
 
 class TestDiagnostics:
@@ -1030,10 +1074,33 @@ class TestChangeDetection:
 
     def test_change_and_discovery_coexist(self, session, layout):
         Path(layout["root_md"]).write_text("# root rules, revised\n")
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        out = self._turn_raw(session)
+        out = collect(session, f"cat {layout['pkg']}/mod.py")
         assert flagged_paths(out) == [layout["pkg_md"]]
         assert self._changed(out) == [layout["root_md"]]
+
+    def test_change_is_caught_on_the_tool_path(self, session, layout):
+        # Not only at turn boundaries: an edit made while the user watches
+        # a long run of tool calls must surface during that run.
+        Path(layout["root_md"]).write_text("# root rules, revised\n")
+        _, out = run_script(
+            ON_BATCH, batch(session.sid, session.cwd, [bash_call("echo hi")]),
+            session.env,
+        )
+        assert self._changed(out) == [layout["root_md"]]
+
+    def test_change_check_is_throttled(self, session, layout):
+        Path(layout["root_md"]).write_text("# revised once\n")
+        _, out = run_script(
+            ON_BATCH, batch(session.sid, session.cwd, [bash_call("echo a")]),
+            session.env,
+        )
+        assert self._changed(out) == [layout["root_md"]]
+        Path(layout["root_md"]).write_text("# revised twice\n")
+        _, out = run_script(
+            ON_BATCH, batch(session.sid, session.cwd, [bash_call("echo b")]),
+            session.env,
+        )
+        assert self._changed(out) == []
 
 
 class TestDirectAccess:
@@ -1048,49 +1115,41 @@ class TestDirectAccess:
 
     def test_read_of_claude_md_suppresses_later_flag(self, session, layout):
         session.tools([read_call(layout["pkg_md"])])
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == []
 
     def test_partial_read_does_not_suppress(self, session, layout):
         # A `limit=1` read returns one line and loads nothing else, so the
         # model does not actually have the rules.
         session.tools([{"tool_name": "Read",
                         "tool_input": {"file_path": layout["pkg_md"], "limit": 1}}])
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
     def test_offset_read_does_not_suppress(self, session, layout):
         session.tools([{"tool_name": "Read",
                         "tool_input": {"file_path": layout["pkg_md"], "offset": 2}}])
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
     def test_write_of_new_claude_md_suppresses(self, session, layout):
         target = Path(layout["plain"]) / "CLAUDE.md"
         target.write_text("# freshly authored\n")
         session.tools([{"tool_name": "Write",
                         "tool_input": {"file_path": str(target)}}])
-        session.bash(f"cat {layout['plain']}/plain.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['plain']}/plain.py") == []
 
     def test_read_is_scoped_to_the_reading_agent(self, session, layout):
         session.tools([read_call(layout["pkg_md"])], agent="sub-r")
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
     def test_read_of_non_instruction_file_does_not_suppress(self, session, layout):
         session.tools([read_call(f"{layout['pkg']}/mod.py")])
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
     def test_direct_read_is_dropped_on_compaction(self, session, layout):
         # The copy lived only in the transcript, which compaction drops.
         session.tools([read_call(layout["pkg_md"])])
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == []
         session.start(source="compact")
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
 
 class TestPseudoFilesystems:
@@ -1130,22 +1189,18 @@ class TestWorktreeKeepsTranscript:
         # it from the transcript, so it must not be surfaced again.
         session.tools([read_call(layout["pkg_md"])])
         self._switch(session, layout)
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == []
 
     def test_flagged_file_not_reflagged_after_switch(self, session, layout):
-        session.bash(f"cat {layout['sibling']}/sib.py")
-        assert session.turn() == [layout["sibling_md"]]
+        assert session.discover(f"cat {layout['sibling']}/sib.py") == [layout["sibling_md"]]
         self._switch(session, layout)
-        session.bash(f"cat {layout['sibling']}/sib.py")
-        assert session.turn() == []
+        assert session.discover(f"cat {layout['sibling']}/sib.py") == []
 
     def test_native_load_is_still_dropped_after_switch(self, session, layout):
         session.loaded(layout["pkg_md"], "nested_traversal",
                        trigger=f"{layout['pkg']}/mod.py")
         self._switch(session, layout)
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert session.turn() == [layout["pkg_md"]]
+        assert session.discover(f"cat {layout['pkg']}/mod.py") == [layout["pkg_md"]]
 
 
 class TestInlining:
@@ -1160,11 +1215,7 @@ class TestInlining:
     """
 
     def _raw(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        _, out = run_script(
-            ON_PROMPT, {"session_id": session.sid, "cwd": session.cwd}, session.env
-        )
-        return out
+        return collect(session, f"cat {layout['pkg']}/mod.py")
 
     def test_content_is_inlined(self, session, layout):
         text = inlined_content(self._raw(session, layout))
@@ -1197,25 +1248,33 @@ class TestInlining:
     def test_budget_spills_later_files_to_read(self, session, layout):
         # Three files that individually fit but together do not.
         size = lib.INLINE_BUDGET // 2
+        calls = []
         for i in range(3):
             d = Path(layout["ws"]) / f"big{i}"
             d.mkdir()
             (d / "CLAUDE.md").write_text(f"# big{i}\n" + "y" * size)
             (d / "f.py").write_text("f = 1\n")
-            session.bash(f"cat {d}/f.py")
-        parsed = parse_message(self._raw(session, layout))
+            calls.append(bash_call(f"cat {d}/f.py"))
+        _, out = run_script(
+            ON_BATCH, batch(session.sid, session.cwd, calls), session.env
+        )
+        parsed = parse_message(out)
         assert parsed["new"], "at least one file should inline"
         assert parsed["overflow"], "the rest should spill to the read path"
 
     def test_message_stays_under_hook_output_cap(self, session, layout):
         size = lib.INLINE_BUDGET // 2
+        calls = []
         for i in range(4):
             d = Path(layout["ws"]) / f"cap{i}"
             d.mkdir()
             (d / "CLAUDE.md").write_text(f"# cap{i}\n" + "z" * size)
             (d / "f.py").write_text("f = 1\n")
-            session.bash(f"cat {d}/f.py")
-        assert len(inlined_content(self._raw(session, layout))) < 10000
+            calls.append(bash_call(f"cat {d}/f.py"))
+        _, out = run_script(
+            ON_BATCH, batch(session.sid, session.cwd, calls), session.env
+        )
+        assert len(inlined_content(out)) < 10000
 
     def test_changed_file_inlines_current_content(self, session, layout):
         Path(layout["root_md"]).write_text("# root rules, revised\nNEW_RULE_MARKER\n")
@@ -1234,8 +1293,7 @@ class TestInlining:
 
     def test_still_records_flag_so_it_emits_once(self, session, layout):
         assert flagged_paths(self._raw(session, layout)) == [layout["pkg_md"]]
-        session.bash(f"grep -rn x {layout['pkg']}/")
-        assert session.turn() == []
+        assert session.discover(f"grep -rn x {layout['pkg']}/") == []
 
 
 class TestAnnouncedIsNotDelivered:
@@ -1251,8 +1309,7 @@ class TestAnnouncedIsNotDelivered:
 
     def test_oversized_file_is_announced_not_inlined(self, session, layout):
         self._oversize(layout)
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        parsed = parse_message(self._raw_turn(session))
+        parsed = parse_message(self._touch(session, layout))
         assert parsed["overflow"] == [layout["pkg_md"]]
         assert parsed["new"] == []
 
@@ -1262,10 +1319,12 @@ class TestAnnouncedIsNotDelivered:
         )
         return out
 
+    def _touch(self, session, layout, command=None):
+        return collect(session, command or f"cat {layout['pkg']}/mod.py")
+
     def test_announcement_is_not_recorded_as_known(self, session, layout):
         self._oversize(layout)
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        self._raw_turn(session)
+        self._touch(session, layout)
         ledger = state_file(session.env, session.sid, ".jsonl").read_text()
         records = [json.loads(ln) for ln in ledger.splitlines() if ln.strip()]
         kinds = {o["t"] for o in records if o.get("p") == layout["pkg_md"]}
@@ -1274,27 +1333,31 @@ class TestAnnouncedIsNotDelivered:
 
     def test_unread_announcement_surfaces_again(self, session, layout):
         self._oversize(layout)
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert parse_message(self._raw_turn(session))["overflow"] == [layout["pkg_md"]]
+        assert parse_message(self._touch(session, layout))["overflow"] == [
+            layout["pkg_md"]
+        ]
         backdate_announcements(session.env, session.sid)
-        session.bash(f"grep -rn x {layout['pkg']}/")
-        assert parse_message(self._raw_turn(session))["overflow"] == [layout["pkg_md"]]
+        assert parse_message(
+            self._touch(session, layout, f"grep -rn x {layout['pkg']}/")
+        )["overflow"] == [layout["pkg_md"]]
 
     def test_repeat_is_rate_limited(self, session, layout):
         self._oversize(layout)
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        assert parse_message(self._raw_turn(session))["overflow"] == [layout["pkg_md"]]
-        session.bash(f"grep -rn x {layout['pkg']}/")
-        assert parse_message(self._raw_turn(session))["overflow"] == []
+        assert parse_message(self._touch(session, layout))["overflow"] == [
+            layout["pkg_md"]
+        ]
+        assert parse_message(
+            self._touch(session, layout, f"grep -rn x {layout['pkg']}/")
+        )["overflow"] == []
 
     def test_reading_it_stops_the_announcements(self, session, layout):
         self._oversize(layout)
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        self._raw_turn(session)
+        self._touch(session, layout)
         session.tools([read_call(layout["pkg_md"])])
         backdate_announcements(session.env, session.sid)
-        session.bash(f"grep -rn x {layout['pkg']}/")
-        assert parse_message(self._raw_turn(session))["overflow"] == []
+        assert parse_message(
+            self._touch(session, layout, f"grep -rn x {layout['pkg']}/")
+        )["overflow"] == []
 
     def test_oversized_change_is_not_marked_current(self, session, layout):
         # A changed file too large to inline must keep reporting, or the
@@ -1318,11 +1381,7 @@ class TestMessageDoesNotHideFromUser:
     """The injected text must not tell the model to withhold from the user."""
 
     def _text(self, session, layout):
-        session.bash(f"cat {layout['pkg']}/mod.py")
-        _, out = run_script(
-            ON_PROMPT, {"session_id": session.sid, "cwd": session.cwd}, session.env
-        )
-        return inlined_content(out)
+        return inlined_content(collect(session, f"cat {layout['pkg']}/mod.py"))
 
     def test_no_instruction_to_withhold(self, session, layout):
         text = self._text(session, layout)

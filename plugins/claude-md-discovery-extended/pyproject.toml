@@ -1,6 +1,6 @@
 [project]
 name = "claude-md-discovery-extended"
-version = "0.6.1"
+version = "0.7.0"
 description = "Flags CLAUDE.md files that never reached the context window, tracking what Claude Code actually loaded via the InstructionsLoaded hook"
 requires-python = ">=3.10"
 dependencies = []

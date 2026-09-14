@@ -83,6 +83,13 @@ INLINE_MAX_FILE = 6000
 # known, and repeat until the read is actually observed — rate-limited so
 # a session working steadily in that directory is not told every batch.
 ANNOUNCE_REPEAT_SECS = 300.0
+
+# Re-hashing every loaded instruction file is cheap but not free, so the
+# staleness check is throttled rather than run on every batch. It must run
+# on the tool path at all, though: doing it only at turn boundaries means
+# an edit made while the user watches a long run of tool calls is not
+# noticed until they next type, which can be many minutes of work later.
+CHANGE_CHECK_SECS = 15.0
 BASH_MAX_CANDIDATES = 20
 
 # `2>/dev/null` and friends appear in a large share of commands and always
@@ -90,6 +97,7 @@ BASH_MAX_CANDIDATES = 20
 # nearly every call.
 BASH_SKIP_PREFIXES = ("/dev/", "/proc/", "/sys/")
 TRIG_MAX = 400
+FTOUCH_MAX = 200
 SUSP_MAX = 200
 
 STATE_MAX_AGE_DAYS = 30
@@ -363,8 +371,12 @@ class State:
         self.susp: list[list] = [
             s for s in data.get("susp", []) if isinstance(s, list) and len(s) == 3
         ]
+        self.ftouch: list[list] = [
+            f for f in data.get("ftouch", []) if isinstance(f, list) and len(f) == 2
+        ]
         self.trig: dict[str, str] = dict(data.get("trig", {}))
         self.cwd: str = data.get("cwd", "") or ""
+        self.last_change_check: float = data.get("checked", 0.0) or 0.0
 
     def _read_ledger(self) -> None:
         """Fold the append-only ledger into `loads` and `flags`."""
@@ -561,29 +573,106 @@ class State:
                 del self.trig[key]
         self._pending_dirty = True
 
-    def suspect(self, directory: str, agent: str, now: float | None = None) -> None:
-        """Record a directory a Bash command touched, pending its grace window.
+    def due_for_change_check(self, now: float) -> bool:
+        """Return whether the staleness check should run on this batch.
+
+        Args:
+            now (float): Epoch seconds.
+        """
+        return now - self.last_change_check >= CHANGE_CHECK_SECS
+
+    def mark_change_check(self, now: float) -> None:
+        """Record that the staleness check just ran.
+
+        Args:
+            now (float): Epoch seconds.
+        """
+        self.last_change_check = now
+        self._pending_dirty = True
+
+    def note_file_touch(self, directory: str, now: float) -> None:
+        """Record that a *file tool* reached into a directory.
+
+        Reading a file makes Claude Code load the CLAUDE.md of every
+        directory from that file up to the project root, and the resulting
+        `InstructionsLoaded` events are asynchronous. Remembering where
+        file tools have been recently is what lets `is_contended` tell a
+        suspicion that must wait from one that can be emitted at once.
+
+        Args:
+            directory (str): Canonical directory the file tool reached.
+            now (float): Epoch seconds.
+        """
+        for entry in self.ftouch:
+            if entry[0] == directory:
+                entry[1] = now
+                self._pending_dirty = True
+                return
+        self.ftouch.append([directory, now])
+        if len(self.ftouch) > FTOUCH_MAX:
+            self.ftouch = self.ftouch[-FTOUCH_MAX:]
+        self._pending_dirty = True
+
+    def is_contended(self, directory: str, now: float) -> bool:
+        """Return whether a load for `directory` may still be in flight.
+
+        A file tool at `directory` or anywhere beneath it triggers a
+        nested load for `directory`'s CLAUDE.md, so only those touches can
+        race. A touch *above* it cannot: the traversal walks upward.
+
+        Args:
+            directory (str): Canonical directory under suspicion.
+            now (float): Epoch seconds.
+        """
+        prefix = directory + "/"
+        for touched, ts in self.ftouch:
+            if now - ts >= GRACE_SECS:
+                continue
+            if touched == directory or touched.startswith(prefix):
+                return True
+        return False
+
+    def suspect(
+        self,
+        directory: str,
+        agent: str,
+        now: float | None = None,
+        contended: bool = False,
+    ) -> None:
+        """Record a directory a Bash command touched.
+
+        A contended suspicion waits out the grace window; an uncontended
+        one is due immediately, so it is emitted by the very
+        `PostToolBatch` that observed it. That distinction is what keeps
+        the plugin useful: a turn is often a single tool call followed by
+        an answer, and a suspicion that always needed a *later* batch
+        would sit unemitted until the user happened to type again.
 
         Args:
             directory (str): Canonical directory path.
             agent (str): The `agent_id` that touched it.
             now (float | None): Epoch seconds, injectable for tests.
+            contended (bool): Whether a file tool may still be loading
+                this directory's instruction files.
         """
         now = time.time() if now is None else now
+        ready_at = now + GRACE_SECS if contended else now
         for entry in self.susp:
             if entry[0] == directory and entry[1] == agent:
+                entry[2] = min(entry[2], ready_at)
+                self._pending_dirty = True
                 return
-        self.susp.append([directory, agent, now])
+        self.susp.append([directory, agent, ready_at])
         if len(self.susp) > SUSP_MAX:
             self.susp = self.susp[-SUSP_MAX:]
         self._pending_dirty = True
 
     def take_due(self, force: bool, now: float | None = None) -> list[tuple[str, str]]:
-        """Remove and return suspicions whose grace window has elapsed.
+        """Remove and return suspicions that are ready to emit.
 
         Args:
-            force (bool): Take every suspicion regardless of age. Used at
-                turn boundaries, where all async loads have landed.
+            force (bool): Take every suspicion regardless of readiness.
+                Used at turn boundaries, where all async loads have landed.
             now (float | None): Epoch seconds, injectable for tests.
 
         Returns:
@@ -591,14 +680,15 @@ class State:
         """
         now = time.time() if now is None else now
         due, keep = [], []
-        for directory, agent, ts in self.susp:
-            if force or now - ts >= GRACE_SECS:
+        for directory, agent, ready_at in self.susp:
+            if force or now >= ready_at:
                 due.append((directory, agent))
             else:
-                keep.append([directory, agent, ts])
+                keep.append([directory, agent, ready_at])
         if len(keep) != len(self.susp):
             self.susp = keep
             self._pending_dirty = True
+        self.ftouch = [f for f in self.ftouch if now - f[1] < GRACE_SECS]
         return due
 
     def set_cwd(self, cwd: str) -> bool:
@@ -684,7 +774,13 @@ class State:
             _write_atomic(
                 self.pending,
                 json.dumps(
-                    {"susp": self.susp, "trig": self.trig, "cwd": self.cwd},
+                    {
+                        "susp": self.susp,
+                        "ftouch": self.ftouch,
+                        "trig": self.trig,
+                        "cwd": self.cwd,
+                        "checked": self.last_change_check,
+                    },
                     separators=(",", ":"),
                 ),
             )

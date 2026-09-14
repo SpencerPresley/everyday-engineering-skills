@@ -21,11 +21,14 @@ nag about a file Claude Code is already loading.
 
 import os
 import sys
+import time
 
 from claude_md_lib import (
     State,
     bash_directories,
     Delivery,
+    commit_change,
+    detect_changes,
     canon,
     config_dir,
     hash_file,
@@ -39,6 +42,11 @@ from hook_runner import emit_context, run
 
 WORKTREE_TOOLS = {"EnterWorktree", "ExitWorktree"}
 WRITE_TOOLS = {"Write", "Edit", "NotebookEdit"}
+
+# Tools that make Claude Code load the instruction files between their
+# target and the project root. Only these can put an InstructionsLoaded
+# event in flight, so only these make a Bash suspicion worth waiting on.
+FILE_TOOLS = {"Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep"}
 
 
 def mark_direct_access(
@@ -88,6 +96,11 @@ def mark_direct_access(
 def observe(state: State, tool_calls: list, cwd: str, agent: str) -> None:
     """Index triggers and raise suspicions for one batch of tool calls.
 
+    Two passes on purpose. Every file tool in the batch is recorded first,
+    so that when a Bash suspicion is judged the plugin already knows
+    whether a load for that directory may still be in flight. One pass
+    would make contention depend on the order tools happen to appear in.
+
     Args:
         state (State): The session state.
         tool_calls (list): The batch's `tool_calls` array.
@@ -95,21 +108,40 @@ def observe(state: State, tool_calls: list, cwd: str, agent: str) -> None:
         agent (str): The `agent_id` of the agent that ran the batch.
     """
     config = config_dir()
+    now = time.time()
+
     for call in tool_calls:
         if not isinstance(call, dict):
             continue
         tool_input = call.get("tool_input") or {}
         if not isinstance(tool_input, dict):
             continue
-
         tool_name = call.get("tool_name")
+
         file_path = tool_input.get("file_path")
         if isinstance(file_path, str):
             state.note_trigger(file_path, agent)
             if os.path.basename(file_path) in memory_basenames():
                 mark_direct_access(state, tool_name, tool_input, file_path, agent)
 
-        if tool_name != "Bash":
+        if tool_name not in FILE_TOOLS:
+            continue
+        target = file_path if isinstance(file_path, str) else tool_input.get("path")
+        if not isinstance(target, str) or not target:
+            continue
+        resolved = canon(
+            target if os.path.isabs(target) else os.path.join(cwd, target)
+        )
+        if not os.path.isdir(resolved):
+            resolved = os.path.dirname(resolved)
+        if resolved:
+            state.note_file_touch(resolved, now)
+
+    for call in tool_calls:
+        if not isinstance(call, dict) or call.get("tool_name") != "Bash":
+            continue
+        tool_input = call.get("tool_input") or {}
+        if not isinstance(tool_input, dict):
             continue
         command = tool_input.get("command")
         if not isinstance(command, str):
@@ -117,7 +149,9 @@ def observe(state: State, tool_calls: list, cwd: str, agent: str) -> None:
         for directory in bash_directories(command, cwd):
             if directory == config or directory.startswith(config + "/"):
                 continue
-            state.suspect(directory, agent)
+            state.suspect(
+                directory, agent, now, state.is_contended(directory, now)
+            )
 
 
 def handle(data: dict) -> None:
@@ -164,6 +198,23 @@ def handle(data: dict) -> None:
 
     ignored = ignored_prefixes()
     delivery = Delivery()
+
+    # Staleness first: a file the model is actively working from matters
+    # more than a newly discovered one, so it gets first call on the
+    # inline budget.
+    now = time.time()
+    changed: list[str] = []
+    if state.due_for_change_check(now):
+        state.mark_change_check(now)
+        for path, content_hash in detect_changes(state, agent, ignored):
+            if delivery.add(path, stale=True):
+                commit_change(state, path, content_hash)
+                changed.append(path)
+            elif state.should_announce(path, agent, now):
+                state.record_announce(path, agent, now)
+            else:
+                delivery.announce.remove(path)
+
     inlined, announced, suppressed = resolve_pending(
         state, root, ignored, delivery
     )
@@ -179,7 +230,7 @@ def handle(data: dict) -> None:
 
     log_event(
         session_id, "flag", trigger="PostToolBatch",
-        inlined=inlined, announced=announced, agent=agent,
+        inlined=inlined, announced=announced, changed=changed, agent=agent,
     )
     emit_context("PostToolBatch", delivery.message())
 
