@@ -25,7 +25,7 @@ import sys
 from claude_md_lib import (
     State,
     bash_directories,
-    build_message,
+    Delivery,
     canon,
     config_dir,
     hash_file,
@@ -163,7 +163,10 @@ def handle(data: dict) -> None:
     observe(state, tool_calls, cwd, agent)
 
     ignored = ignored_prefixes()
-    flagged, suppressed = resolve_pending(state, root, ignored)
+    delivery = Delivery()
+    inlined, announced, suppressed = resolve_pending(
+        state, root, ignored, delivery
+    )
     state.flush()
 
     for candidate, matched in suppressed:
@@ -171,11 +174,14 @@ def handle(data: dict) -> None:
             session_id, "suppress", path=candidate, matched=matched, agent=agent
         )
 
-    if not flagged:
+    if delivery.empty():
         sys.exit(0)
 
-    log_event(session_id, "flag", trigger="PostToolBatch", paths=flagged, agent=agent)
-    emit_context("PostToolBatch", build_message(flagged))
+    log_event(
+        session_id, "flag", trigger="PostToolBatch",
+        inlined=inlined, announced=announced, agent=agent,
+    )
+    emit_context("PostToolBatch", delivery.message())
 
 
 if __name__ == "__main__":

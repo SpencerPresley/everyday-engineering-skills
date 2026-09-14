@@ -62,7 +62,7 @@ def run_script(script: str, payload: dict, env: dict) -> tuple[int, str]:
 
 FRESH_LEAD = "These instruction files apply to directories"
 STALE_LEAD = "changed on disk since the content was loaded"
-OVERFLOW_LEAD = "are too large to include here"
+OVERFLOW_LEAD = "too large to include inline"
 
 
 def parse_message(stdout: str) -> dict[str, list[str]]:
@@ -165,6 +165,18 @@ def read_log(env: dict, sid: str) -> list[dict]:
     if not path.is_file():
         return []
     return [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+
+
+def backdate_announcements(env: dict, sid: str) -> None:
+    """Age every announcement past its repeat window."""
+    path = state_file(env, sid, ".jsonl")
+    lines = [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+    stale = [
+        json.dumps({**o, "ts": 0.0}) for o in lines if o.get("t") == "ann"
+    ]
+    if stale:
+        with open(path, "a") as fh:
+            fh.write("\n".join(stale) + "\n")
 
 
 def age_suspicions(env: dict, sid: str, seconds: float) -> None:
@@ -936,7 +948,7 @@ class TestDiagnostics:
         session.bash(f"cat {layout['pkg']}/mod.py")
         session.turn()
         flags = [e for e in session.log() if e["event"] == "flag"]
-        assert flags and flags[0]["paths"] == [layout["pkg_md"]]
+        assert flags and flags[0]["inlined"] == [layout["pkg_md"]]
 
     def test_steady_state_logs_nothing(self, session, layout):
         before = len(session.log())
@@ -1164,7 +1176,7 @@ class TestInlining:
 
     def test_no_read_instruction_when_inlined(self, session, layout):
         text = inlined_content(self._raw(session, layout))
-        assert "too large to include here" not in text
+        assert "too large to include inline" not in text
 
     def test_path_is_still_reported(self, session, layout):
         assert flagged_paths(self._raw(session, layout)) == [layout["pkg_md"]]
@@ -1224,3 +1236,101 @@ class TestInlining:
         assert flagged_paths(self._raw(session, layout)) == [layout["pkg_md"]]
         session.bash(f"grep -rn x {layout['pkg']}/")
         assert session.turn() == []
+
+
+class TestAnnouncedIsNotDelivered:
+    """A file too large to inline is announced, and announcing delivers nothing.
+
+    Found in a live session: the plugin announced a large CLAUDE.md,
+    recorded it as handled, and never surfaced it again — while its
+    contents had never entered the context window at all.
+    """
+
+    def _oversize(self, layout):
+        Path(layout["pkg_md"]).write_text("# big\n" + "x" * (lib.INLINE_MAX_FILE + 10))
+
+    def test_oversized_file_is_announced_not_inlined(self, session, layout):
+        self._oversize(layout)
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        parsed = parse_message(self._raw_turn(session))
+        assert parsed["overflow"] == [layout["pkg_md"]]
+        assert parsed["new"] == []
+
+    def _raw_turn(self, session):
+        _, out = run_script(
+            ON_PROMPT, {"session_id": session.sid, "cwd": session.cwd}, session.env
+        )
+        return out
+
+    def test_announcement_is_not_recorded_as_known(self, session, layout):
+        self._oversize(layout)
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        self._raw_turn(session)
+        ledger = state_file(session.env, session.sid, ".jsonl").read_text()
+        records = [json.loads(ln) for ln in ledger.splitlines() if ln.strip()]
+        kinds = {o["t"] for o in records if o.get("p") == layout["pkg_md"]}
+        assert "ann" in kinds
+        assert "flag" not in kinds
+
+    def test_unread_announcement_surfaces_again(self, session, layout):
+        self._oversize(layout)
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert parse_message(self._raw_turn(session))["overflow"] == [layout["pkg_md"]]
+        backdate_announcements(session.env, session.sid)
+        session.bash(f"grep -rn x {layout['pkg']}/")
+        assert parse_message(self._raw_turn(session))["overflow"] == [layout["pkg_md"]]
+
+    def test_repeat_is_rate_limited(self, session, layout):
+        self._oversize(layout)
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        assert parse_message(self._raw_turn(session))["overflow"] == [layout["pkg_md"]]
+        session.bash(f"grep -rn x {layout['pkg']}/")
+        assert parse_message(self._raw_turn(session))["overflow"] == []
+
+    def test_reading_it_stops_the_announcements(self, session, layout):
+        self._oversize(layout)
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        self._raw_turn(session)
+        session.tools([read_call(layout["pkg_md"])])
+        backdate_announcements(session.env, session.sid)
+        session.bash(f"grep -rn x {layout['pkg']}/")
+        assert parse_message(self._raw_turn(session))["overflow"] == []
+
+    def test_oversized_change_is_not_marked_current(self, session, layout):
+        # A changed file too large to inline must keep reporting, or the
+        # model silently keeps working from the superseded version.
+        session.loaded(layout["pkg_md"], "nested_traversal",
+                       trigger=f"{layout['pkg']}/mod.py")
+        self._oversize(layout)
+        assert parse_message(self._raw_turn(session))["overflow"] == [layout["pkg_md"]]
+        backdate_announcements(session.env, session.sid)
+        assert parse_message(self._raw_turn(session))["overflow"] == [layout["pkg_md"]]
+
+    def test_inlined_change_is_marked_current(self, session, layout):
+        session.loaded(layout["pkg_md"], "nested_traversal",
+                       trigger=f"{layout['pkg']}/mod.py")
+        Path(layout["pkg_md"]).write_text("# pkg rules, revised\n")
+        assert parse_message(self._raw_turn(session))["changed"] == [layout["pkg_md"]]
+        assert parse_message(self._raw_turn(session))["changed"] == []
+
+
+class TestMessageDoesNotHideFromUser:
+    """The injected text must not tell the model to withhold from the user."""
+
+    def _text(self, session, layout):
+        session.bash(f"cat {layout['pkg']}/mod.py")
+        _, out = run_script(
+            ON_PROMPT, {"session_id": session.sid, "cwd": session.cwd}, session.env
+        )
+        return inlined_content(out)
+
+    def test_no_instruction_to_withhold(self, session, layout):
+        text = self._text(session, layout)
+        assert "Do NOT stop to tell the user" not in text
+        assert "Do not stop to inform the user" not in text
+
+    def test_directs_honest_answers_about_loaded_instructions(self, session, layout):
+        assert "answer honestly" in self._text(session, layout)
+
+    def test_still_says_not_to_derail_the_task(self, session, layout):
+        assert "rather than pausing to report" in self._text(session, layout)

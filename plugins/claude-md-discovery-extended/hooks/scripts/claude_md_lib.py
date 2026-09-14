@@ -77,6 +77,12 @@ WALK_MAX_DEPTH = 25
 # than being allowed to crowd out every other finding.
 INLINE_BUDGET = 8600
 INLINE_MAX_FILE = 6000
+
+# A file too large to inline is only *announced*, which delivers nothing
+# unless the model acts on it. Announcements are therefore not recorded as
+# known, and repeat until the read is actually observed — rate-limited so
+# a session working steadily in that directory is not told every batch.
+ANNOUNCE_REPEAT_SECS = 300.0
 BASH_MAX_CANDIDATES = 20
 
 # `2>/dev/null` and friends appear in a large share of commands and always
@@ -347,6 +353,7 @@ class State:
 
         self.loads: dict[str, dict] = {}
         self.flags: dict[tuple[str, str], str] = {}
+        self.announced: dict[tuple[str, str], float] = {}
         self._appends: list[dict] = []
         self._pending_dirty = False
 
@@ -385,6 +392,10 @@ class State:
                     elif kind == "flag":
                         self.flags[(path, obj.get("a") or MAIN_AGENT)] = (
                             obj.get("h") or ""
+                        )
+                    elif kind == "ann":
+                        self.announced[(path, obj.get("a") or MAIN_AGENT)] = (
+                            obj.get("ts") or 0.0
                         )
                     elif kind == "unload":
                         self.loads.pop(path, None)
@@ -495,6 +506,36 @@ class State:
             return
         self.flags[(path, agent)] = content_hash
         record = {"t": "flag", "p": path, "h": content_hash}
+        if agent:
+            record["a"] = agent
+        self._appends.append(record)
+
+    def should_announce(self, path: str, agent: str, now: float) -> bool:
+        """Return whether an un-inlinable file is due to be announced again.
+
+        Args:
+            path (str): Canonical instruction-file path.
+            agent (str): The `agent_id` the announcement is for.
+            now (float): Epoch seconds.
+        """
+        last = self.announced.get((path, agent))
+        return last is None or now - last >= ANNOUNCE_REPEAT_SECS
+
+    def record_announce(self, path: str, agent: str, now: float) -> None:
+        """Record that an agent was told to read a file we could not inline.
+
+        Deliberately not `record_flag`: an announcement delivers nothing
+        on its own. If the model reads the file, `mark_direct_access`
+        records the flag and the announcement stops; if it does not, the
+        content is genuinely absent and the file must surface again.
+
+        Args:
+            path (str): Canonical instruction-file path.
+            agent (str): The `agent_id` that was told.
+            now (float): Epoch seconds.
+        """
+        self.announced[(path, agent)] = now
+        record = {"t": "ann", "p": path, "ts": now}
         if agent:
             record["a"] = agent
         self._appends.append(record)
@@ -623,6 +664,10 @@ class State:
             if agent:
                 record["a"] = agent
             self._appends.append(record)
+        # Announcements lived in the transcript too; clearing them lets an
+        # un-read large file surface again rather than staying silent.
+        for key in list(self.announced):
+            self.announced[key] = 0.0
         return dropped
 
     def flush(self) -> None:
@@ -814,93 +859,134 @@ def _render(path: str, text: str) -> str:
     return f"Contents of {path}:\n\n{text.rstrip()}\n"
 
 
-def build_message(paths: list[str], changed: list[str] | None = None) -> str:
-    """Build the context injected for unloaded or stale instruction files.
+class Delivery:
+    """Plans how each finding reaches the model, and renders the result.
 
-    Contents are inlined rather than announced. Telling the model to read
-    the file costs a round trip, depends on it complying, and delivers the
-    text as a line-numbered tool result; inlining delivers it in the same
-    `<system-reminder>` framing Claude Code uses for memory it loads
-    itself. Files too large to inline fall back to the announcement, which
-    also keeps the cheap path for the case where inlining would be most
-    expensive if the finding turned out to be wrong.
+    A finding is *inlined* when its contents fit, and merely *announced*
+    when they do not. The distinction matters for bookkeeping, not just
+    presentation: inlining delivers the content, so the file can be marked
+    known, while an announcement delivers nothing unless the model acts on
+    it. Keeping the decision here — rather than splitting the size check
+    and the ledger write across two functions — is what stops the two from
+    disagreeing and marking an un-delivered file as handled.
+    """
+
+    def __init__(self, budget: int = INLINE_BUDGET):
+        """Start a delivery plan.
+
+        Args:
+            budget (int): Characters available for inlined content.
+        """
+        self.budget = budget
+        self.inline_new: list[str] = []
+        self.inline_stale: list[str] = []
+        self.announce: list[str] = []
+
+    def add(self, path: str, stale: bool = False) -> bool:
+        """Place one finding, inlining it when it fits.
+
+        Args:
+            path (str): Canonical instruction-file path.
+            stale (bool): Whether this is a changed file rather than a new
+                discovery.
+
+        Returns:
+            bool: `True` when the contents were inlined, `False` when the
+                  file could only be announced.
+        """
+        text = _read_text(path)
+        if text is None or len(text) > INLINE_MAX_FILE:
+            self.announce.append(path)
+            return False
+        block = _render(path, text)
+        if len(block) > self.budget:
+            self.announce.append(path)
+            return False
+        self.budget -= len(block)
+        (self.inline_stale if stale else self.inline_new).append(block)
+        return True
+
+    def empty(self) -> bool:
+        """Return whether nothing at all needs to be said."""
+        return not (self.inline_new or self.inline_stale or self.announce)
+
+    def message(self) -> str:
+        """Render the planned delivery as context for the model.
+
+        Returns:
+            str: The message to inject, or `""` when there is nothing.
+        """
+        if self.empty():
+            return ""
+
+        sections: list[str] = []
+
+        if self.inline_new:
+            sections.append(
+                "These instruction files apply to directories this session "
+                "has worked in, but Claude Code did not load them: a nested "
+                "CLAUDE.md is only auto-loaded when a file tool reaches its "
+                "directory, and Bash operations bypass that. Treat the "
+                "contents below as project instructions.\n\n"
+                + "\n".join(self.inline_new)
+            )
+
+        if self.inline_stale:
+            plural = "files have" if len(self.inline_stale) > 1 else "file has"
+            sections.append(
+                f"The following instruction {plural} changed on disk since "
+                "the content was loaded into your context. What follows is "
+                "current and supersedes the version you are holding.\n\n"
+                + "\n".join(self.inline_stale)
+            )
+
+        if self.announce:
+            listing = "\n".join(f"  - {path}" for path in self.announce)
+            verb = "it" if len(self.announce) == 1 else "each of them"
+            sections.append(
+                "These instruction files also apply here, but are too large "
+                "to include inline, so their contents are NOT in your "
+                f"context. IMPORTANT: use the Read tool to read {verb}:\n"
+                f"{listing}"
+            )
+
+        return (
+            "<claude-md-discovery-extended>\n"
+            + "\n\n".join(sections)
+            + "\n\n"
+            "This is a user-installed hook which detects CLAUDE.md files "
+            "that do not load, because Claude Code cannot tell which "
+            "directories you are reaching into when you use the Bash tool. "
+            "Keep working the way you were. It will surface any other "
+            "unloaded CLAUDE.md the same way.\n"
+            "\n"
+            "If any file above references others via @path imports, read "
+            "those with the Read tool — imports are only auto-resolved for "
+            "natively loaded memory files.\n"
+            "\n"
+            "Carry on with your current task rather than pausing to report "
+            "this. If the user asks what instructions you have loaded, "
+            "answer honestly and include these.\n"
+            "</claude-md-discovery-extended>"
+        )
+
+
+def build_message(paths: list[str], changed: list[str] | None = None) -> str:
+    """Render findings for callers that do not need the delivery plan.
 
     Args:
         paths (list[str]): Instruction files the agent has not seen.
-        changed (list[str] | None): Loaded files whose content changed on
-            disk since it entered context.
+        changed (list[str] | None): Loaded files whose content changed.
 
     Returns:
         str: The message to inject as additional context.
     """
-    budget = INLINE_BUDGET
-    fresh: list[str] = []
-    stale: list[str] = []
-    overflow: list[str] = []
-
-    for path, is_stale in (
-        [(p, False) for p in paths] + [(p, True) for p in (changed or [])]
-    ):
-        text = _read_text(path)
-        if text is None or len(text) > INLINE_MAX_FILE:
-            overflow.append(path)
-            continue
-        block = _render(path, text)
-        if len(block) > budget:
-            overflow.append(path)
-            continue
-        budget -= len(block)
-        (stale if is_stale else fresh).append(block)
-
-    sections: list[str] = []
-
-    if fresh:
-        sections.append(
-            "These instruction files apply to directories this session has "
-            "worked in, but Claude Code did not load them: a nested "
-            "CLAUDE.md is only auto-loaded when a file tool reaches its "
-            "directory, and Bash operations bypass that. Treat the contents "
-            "below as project instructions.\n\n"
-            + "\n".join(fresh)
-        )
-
-    if stale:
-        plural = "files have" if len(stale) > 1 else "file has"
-        sections.append(
-            f"The following instruction {plural} changed on disk since the "
-            "content was loaded into your context. What follows is current "
-            "and supersedes the version you are holding.\n\n"
-            + "\n".join(stale)
-        )
-
-    if overflow:
-        listing = "\n".join(f"  - {path}" for path in overflow)
-        verb = "it" if len(overflow) == 1 else "each of them"
-        sections.append(
-            "These instruction files are too large to include here. "
-            f"IMPORTANT: You must use the Read tool to read {verb}:\n"
-            f"{listing}"
-        )
-
-    return (
-        "<claude-md-discovery-extended>\n"
-        + "\n\n".join(sections)
-        + "\n\n"
-        "This is a user-installed hook which detects CLAUDE.md files that do "
-        "not load because Claude Code cannot tell which directories you are "
-        "looking at when you use the Bash tool for file operations. Do not "
-        "change how you are working. It will notify you again if another "
-        "unloaded CLAUDE.md appears, and never about one already in your "
-        "context.\n"
-        "\n"
-        "If any file above references others via @path imports, read those "
-        "with the Read tool — imports are only auto-resolved for natively "
-        "loaded memory files.\n"
-        "\n"
-        "Continue your current task. Do NOT stop to tell the user about "
-        "this.\n"
-        "</claude-md-discovery-extended>"
-    )
+    delivery = Delivery()
+    for path in paths:
+        delivery.add(path)
+    for path in changed or []:
+        delivery.add(path, stale=True)
+    return delivery.message()
 
 
 def gc_state(now: float | None = None) -> int:
@@ -947,14 +1033,20 @@ def drop_session(session_id: str) -> None:
             pass
 
 
-def detect_changes(state: "State", agent: str, ignored: tuple[str, ...]) -> list[str]:
+def detect_changes(
+    state: "State", agent: str, ignored: tuple[str, ...]
+) -> list[tuple[str, str]]:
     """Find loaded instruction files whose content changed on disk.
 
     Claude Code loads a memory file once and never reloads it, so editing
     a CLAUDE.md while a session runs leaves the session working from the
     old rules with no indication. Re-hashing at the turn boundary closes
-    that window. A file whose new content is already in context (an edit
-    that converged on another known file) is updated silently.
+    that window.
+
+    Reports without committing: the caller records the new hash only once
+    the new content has actually been delivered. Marking it current before
+    then would bury the change if the file turned out to be too large to
+    inline.
 
     Args:
         state (State): The session state.
@@ -962,9 +1054,9 @@ def detect_changes(state: "State", agent: str, ignored: tuple[str, ...]) -> list
         ignored (tuple[str, ...]): Ignored path prefixes.
 
     Returns:
-        list[str]: Paths whose content changed since they were loaded.
+        list[tuple[str, str]]: `(path, new hash)` for each changed file.
     """
-    changed: list[str] = []
+    changed: list[tuple[str, str]] = []
     known = state.known_hashes(agent)
     for path, meta in list(state.loads.items()):
         if not state.visible_to(meta, agent) or is_ignored(path, ignored):
@@ -972,10 +1064,26 @@ def detect_changes(state: "State", agent: str, ignored: tuple[str, ...]) -> list
         content_hash = hash_file(path)
         if not content_hash or content_hash == meta["h"]:
             continue
-        if content_hash not in known:
-            changed.append(path)
-        state.record_load(path, content_hash, meta["r"], meta["g"])
+        if content_hash in known:
+            # Converged on content already in context; nothing to say, but
+            # keep the record current so it is not re-examined.
+            state.record_load(path, content_hash, meta["r"], meta["g"])
+            continue
+        changed.append((path, content_hash))
     return changed
+
+
+def commit_change(state: "State", path: str, content_hash: str) -> None:
+    """Mark a changed file's new content as the one now in context.
+
+    Args:
+        state (State): The session state.
+        path (str): Canonical instruction-file path.
+        content_hash (str): The hash that was just delivered.
+    """
+    meta = state.loads.get(path)
+    if meta:
+        state.record_load(path, content_hash, meta["r"], meta["g"])
 
 
 def seed_root(state: "State", root: str) -> None:
@@ -1008,24 +1116,34 @@ def resolve_pending(
     state: State,
     cwd: str,
     ignored: tuple[str, ...],
+    delivery: "Delivery",
     force: bool = False,
     now: float | None = None,
-) -> tuple[list[str], list[tuple[str, str]]]:
-    """Turn matured suspicions into the set of files worth flagging.
+) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+    """Turn matured suspicions into planned deliveries.
+
+    Records what was actually achieved, not merely what was attempted: a
+    file whose contents were inlined is marked known, while one that could
+    only be announced is recorded as an announcement and will surface
+    again until the model is observed reading it.
 
     Args:
         state (State): The session state.
         cwd (str): Canonical session working directory.
         ignored (tuple[str, ...]): Ignored path prefixes.
+        delivery (Delivery): Plan to add findings to.
         force (bool): Ignore the grace window (turn boundaries).
         now (float | None): Epoch seconds, injectable for tests.
 
     Returns:
-        tuple: `(flagged, suppressed)` — canonical paths to tell the agent
-            about, and `(candidate, matched)` pairs suppressed by a content
-            hash already in that agent's context, for diagnostics.
+        tuple: `(inlined, announced, suppressed)` — paths whose contents
+            were delivered, paths the model was merely told to read, and
+            `(candidate, matched)` pairs suppressed by a content hash
+            already in that agent's context.
     """
-    flagged: list[str] = []
+    now = time.time() if now is None else now
+    inlined: list[str] = []
+    announced: list[str] = []
     suppressed: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -1043,13 +1161,21 @@ def resolve_pending(
                 suppressed.append(
                     (path, state.path_for_hash(content_hash, agent) or "")
                 )
-                # Recorded as flagged so an identical copy is not
+                # Recorded as known so an identical copy is not
                 # re-examined on every future touch of the same tree.
                 state.record_flag(path, content_hash, agent)
                 continue
             seen.add(path)
-            flagged.append(path)
-            known.add(content_hash)
-            state.record_flag(path, content_hash, agent)
+            if delivery.add(path):
+                inlined.append(path)
+                known.add(content_hash)
+                state.record_flag(path, content_hash, agent)
+            elif state.should_announce(path, agent, now):
+                announced.append(path)
+                state.record_announce(path, agent, now)
+            else:
+                # Announced recently and still unread; stay quiet until the
+                # repeat window reopens.
+                delivery.announce.remove(path)
 
-    return flagged, suppressed
+    return inlined, announced, suppressed

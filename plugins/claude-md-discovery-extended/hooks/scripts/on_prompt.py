@@ -19,11 +19,13 @@ used.
 """
 
 import sys
+import time
 
 from claude_md_lib import (
     State,
-    build_message,
+    Delivery,
     canon,
+    commit_change,
     detect_changes,
     ignored_prefixes,
     log_event,
@@ -54,21 +56,36 @@ def handle(data: dict) -> None:
         seed_root(state, root)
 
     ignored = ignored_prefixes()
-    flagged, suppressed = resolve_pending(state, root, ignored, force=True)
-    changed = detect_changes(state, "", ignored)
+    delivery = Delivery()
+
+    # Staleness first: a changed file the model is actively working from
+    # matters more than a newly discovered one, so it gets the budget.
+    changed: list[str] = []
+    for path, content_hash in detect_changes(state, "", ignored):
+        if delivery.add(path, stale=True):
+            commit_change(state, path, content_hash)
+            changed.append(path)
+        elif state.should_announce(path, "", time.time()):
+            state.record_announce(path, "", time.time())
+        else:
+            delivery.announce.remove(path)
+
+    inlined, announced, suppressed = resolve_pending(
+        state, root, ignored, delivery, force=True
+    )
     state.flush()
 
     for candidate, matched in suppressed:
         log_event(session_id, "suppress", path=candidate, matched=matched)
 
-    if not flagged and not changed:
+    if delivery.empty():
         sys.exit(0)
 
     log_event(
-        session_id, "flag",
-        trigger="UserPromptSubmit", paths=flagged, changed=changed,
+        session_id, "flag", trigger="UserPromptSubmit",
+        inlined=inlined, announced=announced, changed=changed,
     )
-    emit_context("UserPromptSubmit", build_message(flagged, changed))
+    emit_context("UserPromptSubmit", delivery.message())
 
 
 if __name__ == "__main__":

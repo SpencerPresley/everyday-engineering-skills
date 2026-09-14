@@ -1,7 +1,7 @@
 {
   "name": "claude-md-discovery-extended",
   "description": "Flags CLAUDE.md files that never made it into context. Claude Code loads a nested CLAUDE.md only when a file tool reaches its directory, so Bash operations bypass it silently. Tracks what Claude Code actually loaded via the InstructionsLoaded hook, watches Bash commands and cd for directories it missed, and tells Claude to read the difference.",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "author": {
     "name": "Spencer Presley"
   }
