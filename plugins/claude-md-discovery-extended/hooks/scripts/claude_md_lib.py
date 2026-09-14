@@ -1,65 +1,69 @@
-"""Shared state and discovery logic for the claude-md-discovery-extended hooks.
+"""Shared state and discovery logic for claude-md-discovery-extended.
 
-The plugin keeps one append-only JSONL ledger per session recording every
-memory file (CLAUDE.md / AGENTS.md) whose content is known, keyed by path
-with a content hash. Discovery suppresses any candidate whose content hash
-matches something already known, which is what makes duplicated files (git
-worktrees, multiple clones, copied templates) not re-flag.
+Claude Code reports every instruction file it loads through the
+``InstructionsLoaded`` hook, so this plugin never infers what is in
+context — it records what Claude Code says. The inference that remains is
+confined to one question: which directories did a ``Bash`` command touch?
 
-Ledger entry kinds:
-    - ``context``: content is in the model's context via Claude Code's own
-      loading (ancestor walk at startup, global user memory, cwd-subtree
-      files loaded on demand as the model accesses them).
-    - ``flagged``: content entered context through the transcript (the
-      plugin flagged it, or the model read/cat'd it directly). These are
-      dropped after compaction because the transcript no longer carries
-      them. Flagged entries are scoped per agent: a subagent's tool calls
-      fire the same hooks with an ``agent_id``, and a file flagged inside
-      a subagent's transcript is not in the main agent's context (or any
-      other agent's), so it must not suppress discovery there.
-    - ``equiv``: content exists inside the project tree (found by the
-      session-start scan) but has not necessarily been loaded. Used only to
-      suppress byte-identical copies outside the project.
+Two files per session live in the state directory:
+
+``<session>.jsonl``
+    Append-only ledger of ``load`` records (an instruction file Claude
+    Code loaded) and ``flag`` records (a file this plugin told an agent to
+    read). Later lines win for the same key.
+
+``<session>.pending.json``
+    Rewritten scratch state: suspected directories awaiting their grace
+    window, the trigger index used to attribute loads to agents, and the
+    last working directory seen.
+
+Agent scoping
+-------------
+``InstructionsLoaded`` carries no ``agent_id`` even when a subagent's tool
+call caused the load, but it does carry ``trigger_file_path``, which
+matches the triggering tool's ``tool_input.file_path`` byte for byte. Tool
+events *do* carry ``agent_id``, so the trigger index maps raw trigger
+paths to the agent that touched them, and attribution is resolved lazily
+at emit time — by then the index is populated, which sidesteps the race
+where an ``InstructionsLoaded`` event arrives before the tool batch that
+explains it.
+
+Loads with reason ``session_start`` or ``compact`` are treated as visible
+to every agent; lazily triggered loads belong to the agent that triggered
+them. That is a judgment call: nested loads demonstrably attach to the
+triggering agent, while the project and user memory almost certainly reach
+subagents too.
 """
 
 import hashlib
 import json
 import os
 import re
-import subprocess
+import shlex
 import time
 
-MEMORY_BASENAMES = ("CLAUDE.md", "AGENTS.md")
+MEMORY_BASENAMES = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md")
+CLAUDE_BASENAMES = ("CLAUDE.md", "CLAUDE.local.md")
 
-KIND_CONTEXT = "context"
-KIND_FLAGGED = "flagged"
-KIND_EQUIV = "equiv"
+# Reasons whose loads are visible to every agent in the session.
+GLOBAL_LOAD_REASONS = frozenset({"session_start", "compact"})
 
-_KIND_RANK = {KIND_EQUIV: 0, KIND_CONTEXT: 1, KIND_FLAGGED: 1}
+MAIN_AGENT = ""
 
-SEEDED_MARKER = "__seeded__"
+# Observed InstructionsLoaded latency in probe sessions ranged from 0.03s
+# to 4.54s, and an event landed 24ms *after* the PostToolBatch for the
+# batch that caused it. A suspicion younger than this is not emitted, or
+# a Bash call touching the same directory as a concurrent Read would nag
+# about a file Claude Code is in the middle of loading anyway.
+GRACE_SECS = 10.0
 
-# Directories never worth descending into during the project scan.
-SCAN_PRUNE_NAMES = {
-    "node_modules",
-    "__pycache__",
-    "venv",
-    "env",
-    "dist",
-    "build",
-    "target",
-    "vendor",
-    "coverage",
-}
-SCAN_MAX_DIRS = 3000
-SCAN_TIME_BUDGET_SECS = 1.5
-GIT_TIMEOUT_SECS = 3
+WALK_MAX_DEPTH = 25
+BASH_MAX_CANDIDATES = 20
+TRIG_MAX = 400
+SUSP_MAX = 200
 
 STATE_MAX_AGE_DAYS = 30
-LEGACY_MAX_AGE_DAYS = 7
-
 _HASH_READ_CAP = 4 * 1024 * 1024
-
 LOG_MAX_BYTES = 1024 * 1024
 
 
@@ -78,21 +82,20 @@ def memory_basenames() -> tuple[str, ...]:
     """Return the instruction-file basenames currently in scope.
 
     Returns:
-        tuple[str, ...]: `("CLAUDE.md", "AGENTS.md")` or just
-                         `("CLAUDE.md",)` when AGENTS.md discovery is off.
+        tuple[str, ...]: All memory basenames, or just the CLAUDE.md
+                         family when AGENTS.md discovery is disabled.
     """
     if agents_md_enabled():
         return MEMORY_BASENAMES
-    return (MEMORY_BASENAMES[0],)
+    return CLAUDE_BASENAMES
 
 
 def ignored_prefixes() -> tuple[str, ...]:
     """Parse `CLAUDE_MD_DISCOVERY_IGNORE` into normalized path prefixes.
 
     The variable holds `os.pathsep`-separated absolute (or `~`-prefixed)
-    paths. Anything under an ignored prefix is fully invisible to the
-    plugin: never flagged, never recorded, never used for suppression.
-    `/` works as a kill switch that disables the plugin entirely.
+    paths. Anything under an ignored prefix is invisible to the plugin.
+    `/` works as a kill switch that disables it entirely.
 
     Returns:
         tuple[str, ...]: Canonicalized path prefixes, possibly empty.
@@ -104,7 +107,7 @@ def ignored_prefixes() -> tuple[str, ...]:
         if part.startswith("~"):
             part = os.path.expanduser(part)
         if part.startswith("/"):
-            prefixes.append(os.path.realpath(part).rstrip("/") or "/")
+            prefixes.append(canon(part))
     return tuple(prefixes)
 
 
@@ -121,15 +124,31 @@ def is_ignored(path: str, prefixes: tuple[str, ...]) -> bool:
     return False
 
 
+def canon(path: str) -> str:
+    """Canonicalize a path for use as a ledger key.
+
+    `InstructionsLoaded` reports `file_path` already symlink-resolved
+    (`/private/tmp/...` on macOS) while `trigger_file_path` and tool
+    inputs arrive as typed (`/tmp/...`). Without canonicalizing both
+    sides every entry would split in two.
+
+    Args:
+        path (str): Any absolute or relative path.
+
+    Returns:
+        str: The symlink-resolved absolute path, without a trailing slash.
+    """
+    return os.path.realpath(path).rstrip("/") or "/"
+
+
 def config_dir() -> str:
     """Return the Claude Code config directory, canonicalized.
 
     Honors `CLAUDE_CONFIG_DIR`, falling back to `~/.claude`. Everything
-    inside this tree is Claude Code's own config and installed plugins;
-    its `CLAUDE.md` is the global user memory that Claude Code always loads
-    at startup. Discovery must never resurface files from here, or touching
-    any config/plugin path (which happens constantly) would nag the model
-    to re-read instructions already in context.
+    under this tree is Claude Code's own config and installed plugins, so
+    discovery never surfaces files from it — touching a plugin path
+    happens constantly and would nag about instructions that are either
+    already loaded or not a project's at all.
 
     Returns:
         str: The absolute, symlink-resolved config directory path.
@@ -137,16 +156,15 @@ def config_dir() -> str:
     raw = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
         os.path.expanduser("~"), ".claude"
     )
-    return os.path.realpath(raw).rstrip("/") or "/"
+    return canon(raw)
 
 
 def state_dir() -> str:
-    """Return the directory holding per-session ledgers, creating it if needed.
+    """Return the directory holding per-session state, creating it if needed.
 
     Lives under the config dir rather than `TMPDIR` so state survives
-    reboots and tmp reapers (macOS purges `/tmp` files unused for 3 days,
-    which would make long or resumed sessions re-flag everything).
-    `CLAUDE_MD_DISCOVERY_STATE_DIR` overrides the location (used by tests).
+    reboots and tmp reapers. `CLAUDE_MD_DISCOVERY_STATE_DIR` overrides
+    the location (used by tests).
 
     Returns:
         str: The absolute state directory path.
@@ -164,19 +182,25 @@ def _safe_id(session_id: str) -> str:
     Args:
         session_id (str): The Claude Code session identifier.
     """
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", session_id) or "unknown"
 
 
 def ledger_path(session_id: str) -> str:
-    """Return the ledger file path for a session.
+    """Return the append-only ledger path for a session.
 
     Args:
         session_id (str): The Claude Code session identifier.
-
-    Returns:
-        str: Absolute path of the session's JSONL ledger.
     """
     return os.path.join(state_dir(), f"{_safe_id(session_id)}.jsonl")
+
+
+def pending_path(session_id: str) -> str:
+    """Return the rewritable scratch-state path for a session.
+
+    Args:
+        session_id (str): The Claude Code session identifier.
+    """
+    return os.path.join(state_dir(), f"{_safe_id(session_id)}.pending.json")
 
 
 def log_path(session_id: str) -> str:
@@ -184,9 +208,6 @@ def log_path(session_id: str) -> str:
 
     Args:
         session_id (str): The Claude Code session identifier.
-
-    Returns:
-        str: Absolute path of the session's JSONL event log.
     """
     return os.path.join(state_dir(), f"{_safe_id(session_id)}.log")
 
@@ -194,20 +215,17 @@ def log_path(session_id: str) -> str:
 def log_event(session_id: str, event: str, **fields) -> None:
     """Append a diagnostic event to the session's log file.
 
-    Event-driven, not per-call: steady-state hook invocations log
-    nothing, so a session's log stays small (seeds, flags, suppressions,
-    lifecycle actions, and swallowed exceptions). The log lives beside
-    the ledger and is reaped by the same GC. Writing stops past
-    `LOG_MAX_BYTES` so a pathological event loop can't fill the disk.
-    Never raises: diagnostics must not break the hook.
+    Event-driven, not per-call: steady-state hook invocations log nothing.
+    Writing stops past `LOG_MAX_BYTES` so a pathological loop cannot fill
+    the disk. Never raises — diagnostics must not break a hook.
 
     Args:
         session_id (str): The Claude Code session identifier.
-        event (str): Short event name (e.g. `seed`, `flag`, `error`).
+        event (str): Short event name (e.g. `flag`, `suppress`, `error`).
         **fields: JSON-serializable event details.
     """
     try:
-        path = log_path(session_id or "unknown")
+        path = log_path(session_id)
         try:
             if os.path.getsize(path) > LOG_MAX_BYTES:
                 return
@@ -228,8 +246,8 @@ def log_event(session_id: str, event: str, **fields) -> None:
 def hash_file(path: str) -> str | None:
     """Return a content hash for a file, or `None` if unreadable.
 
-    Reads at most `_HASH_READ_CAP` bytes and mixes in the file size so
-    a pathological multi-megabyte file still hashes deterministically
+    Reads at most `_HASH_READ_CAP` bytes and mixes in the file size so a
+    pathological multi-megabyte file still hashes deterministically
     without stalling the hook.
 
     Args:
@@ -248,429 +266,699 @@ def hash_file(path: str) -> str | None:
         return None
 
 
-def load_ledger(path: str) -> tuple[dict[str, dict], dict[tuple[str, str], str], bool]:
-    """Load a ledger file into its global and per-agent mappings.
-
-    Later lines win for the same key, so appends act as updates.
-    Malformed lines (e.g. a torn concurrent write) are skipped.
+def _read_pending(path: str) -> dict:
+    """Load the scratch-state file, tolerating absence or corruption.
 
     Args:
-        path (str): Ledger file path.
+        path (str): Pending-state file path.
 
     Returns:
-        tuple: `(entries, flagged, seeded)` — global path-keyed mapping of
-            `{"h": hash, "k": kind}` for ``context``/``equiv`` entries,
-            `(path, agent_scope)`-keyed hash mapping for ``flagged``
-            entries, and whether the session has been seeded.
+        dict: Parsed state, or an empty dict when unreadable.
     """
-    entries: dict[str, dict] = {}
-    flagged: dict[tuple[str, str], str] = {}
-    seeded = False
     try:
         with open(path, "r") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                if obj.get(SEEDED_MARKER):
-                    seeded = True
-                    continue
-                p, h, k = obj.get("p"), obj.get("h"), obj.get("k")
-                if not (p and h and k in _KIND_RANK):
-                    continue
-                if k == KIND_FLAGGED:
-                    flagged[(p, obj.get("a") or "")] = h
-                else:
-                    entries[p] = {"h": h, "k": k}
-    except OSError:
-        pass
-    return entries, flagged, seeded
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
-def append_entries(path: str, records: list[dict]) -> None:
-    """Append records to the ledger as JSONL.
-
-    Written as a single `write()` of small lines so concurrent hook
-    invocations (parallel tool calls) interleave at line granularity
-    at worst, which `load_ledger` tolerates.
+def _write_atomic(path: str, text: str) -> None:
+    """Replace a file's contents atomically with mode 0600.
 
     Args:
-        path (str): Ledger file path.
-        records (list[dict]): JSON-serializable records to append.
+        path (str): Destination path.
+        text (str): Full file contents.
     """
-    if not records:
-        return
-    payload = "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in records)
-    with open(path, "a") as fh:
-        fh.write(payload)
-    os.chmod(path, 0o600)
-
-
-def rewrite_ledger(
-    path: str,
-    entries: dict[str, dict],
-    flagged: dict[tuple[str, str], str],
-    seeded: bool,
-) -> None:
-    """Atomically rewrite a ledger from folded mappings.
-
-    Args:
-        path (str): Ledger file path.
-        entries (dict[str, dict]): Global mapping of file path to `{"h", "k"}`.
-        flagged (dict[tuple[str, str], str]): Per-agent flagged hashes.
-        seeded (bool): Whether to preserve the seeded marker.
-    """
-    tmp = path + ".tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as fh:
-        if seeded:
-            fh.write(json.dumps({SEEDED_MARKER: True}) + "\n")
-        for p, meta in entries.items():
-            record = {"p": p, "h": meta["h"], "k": meta["k"]}
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
-        for (p, scope), h in flagged.items():
-            record = {"p": p, "h": h, "k": KIND_FLAGGED}
-            if scope:
-                record["a"] = scope
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        fh.write(text)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
-class Ledger:
-    """In-memory view of a session ledger with pending-append buffering.
+class State:
+    """Per-session view of what Claude Code has loaded and what is pending.
 
-    ``context``/``equiv`` entries are session-global (disk-derived facts).
-    ``flagged`` entries are visible only within the agent scope that
-    recorded them — the main agent uses the empty scope; subagent tool
-    calls carry an `agent_id` in the hook input.
+    Attributes:
+        loads (dict[str, dict]): Canonical instruction-file path to
+            `{"h": hash, "r": load_reason, "g": raw trigger path}`.
+        flags (dict[tuple[str, str], str]): `(path, agent)` to the content
+            hash this plugin told that agent to read.
+        susp (list[list]): Pending `[directory, agent, timestamp]` triples.
+        trig (dict[str, str]): Raw tool-input path to the `agent_id` that
+            touched it, used to attribute loads.
+        cwd (str): Last working directory observed, canonicalized.
     """
 
-    def __init__(self, session_id: str, scope: str = ""):
-        """Load the ledger for a session.
+    def __init__(self, session_id: str):
+        """Load all state for a session.
 
         Args:
             session_id (str): The Claude Code session identifier.
-            scope (str): Agent scope — `""` for the main agent, or the
-                `agent_id` from the hook input for subagent tool calls.
         """
-        self.path = ledger_path(session_id)
-        self.scope = scope
-        self.entries, self._flagged, self.seeded = load_ledger(self.path)
-        self._pending: list[dict] = []
-        self._hashes: set[str] | None = None
+        self.session_id = session_id
+        self.ledger = ledger_path(session_id)
+        self.pending = pending_path(session_id)
 
-    def known_hashes(self) -> set[str]:
-        """Return every content hash known to the current agent scope."""
-        if self._hashes is None:
-            self._hashes = {meta["h"] for meta in self.entries.values()}
-            self._hashes.update(
-                h for (_, s), h in self._flagged.items() if s == self.scope
-            )
-        return self._hashes
+        self.loads: dict[str, dict] = {}
+        self.flags: dict[tuple[str, str], str] = {}
+        self._appends: list[dict] = []
+        self._pending_dirty = False
 
-    def path_for_hash(self, content_hash: str) -> str | None:
-        """Return some ledger path holding the given hash, for diagnostics.
+        self._read_ledger()
+
+        data = _read_pending(self.pending)
+        self.susp: list[list] = [
+            s for s in data.get("susp", []) if isinstance(s, list) and len(s) == 3
+        ]
+        self.trig: dict[str, str] = dict(data.get("trig", {}))
+        self.cwd: str = data.get("cwd", "") or ""
+
+    def _read_ledger(self) -> None:
+        """Fold the append-only ledger into `loads` and `flags`."""
+        try:
+            with open(self.ledger, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    kind, path = obj.get("t"), obj.get("p")
+                    if not path:
+                        continue
+                    if kind == "load":
+                        self.loads[path] = {
+                            "h": obj.get("h") or "",
+                            "r": obj.get("r") or "",
+                            "g": obj.get("g") or "",
+                        }
+                    elif kind == "flag":
+                        self.flags[(path, obj.get("a") or MAIN_AGENT)] = (
+                            obj.get("h") or ""
+                        )
+                    elif kind == "unload":
+                        self.loads.pop(path, None)
+                    elif kind == "unflag":
+                        self.flags.pop((path, obj.get("a") or MAIN_AGENT), None)
+        except OSError:
+            pass
+
+    def agent_for_load(self, meta: dict) -> str:
+        """Return the agent whose context a load entered.
+
+        Args:
+            meta (dict): A `loads` value.
+
+        Returns:
+            str: The owning `agent_id`, or `MAIN_AGENT` for the main
+                 conversation and for session-wide loads.
+        """
+        if meta.get("r") in GLOBAL_LOAD_REASONS:
+            return MAIN_AGENT
+        return self.trig.get(meta.get("g") or "", MAIN_AGENT)
+
+    def visible_to(self, meta: dict, agent: str) -> bool:
+        """Return whether a load is in the given agent's context.
+
+        Args:
+            meta (dict): A `loads` value.
+            agent (str): The `agent_id` to test, `MAIN_AGENT` for the main
+                conversation.
+        """
+        if meta.get("r") in GLOBAL_LOAD_REASONS:
+            return True
+        return self.agent_for_load(meta) == agent
+
+    def is_known(self, path: str, agent: str) -> bool:
+        """Return whether an agent has already seen an instruction file.
+
+        Args:
+            path (str): Canonical instruction-file path.
+            agent (str): The `agent_id` to test.
+        """
+        meta = self.loads.get(path)
+        if meta is not None and self.visible_to(meta, agent):
+            return True
+        return (path, agent) in self.flags
+
+    def known_hashes(self, agent: str) -> set[str]:
+        """Return every content hash already in an agent's context.
+
+        Suppression is by content, not path, so byte-identical copies
+        across worktrees, clones, and templated projects never re-flag.
+        Unlike the pre-0.5 ledger this draws only on content Claude Code
+        reported loading (or that this plugin flagged), never on files
+        merely found on disk.
+
+        Args:
+            agent (str): The `agent_id` to collect hashes for.
+        """
+        hashes = {
+            meta["h"]
+            for meta in self.loads.values()
+            if meta["h"] and self.visible_to(meta, agent)
+        }
+        hashes.update(h for (_, a), h in self.flags.items() if a == agent and h)
+        return hashes
+
+    def path_for_hash(self, content_hash: str, agent: str) -> str | None:
+        """Return some path holding a hash, for suppression diagnostics.
 
         Args:
             content_hash (str): Content hash to look up.
+            agent (str): The `agent_id` whose view to search.
         """
-        for path, meta in self.entries.items():
-            if meta["h"] == content_hash:
+        for path, meta in self.loads.items():
+            if meta["h"] == content_hash and self.visible_to(meta, agent):
                 return path
-        for (path, scope), h in self._flagged.items():
-            if scope == self.scope and h == content_hash:
+        for (path, a), h in self.flags.items():
+            if a == agent and h == content_hash:
                 return path
         return None
 
-    def get(self, path: str) -> dict | None:
-        """Return the entry for a path as seen by the current agent scope.
-
-        The global entry wins (it always tracks the latest observed disk
-        content); a flagged entry in this scope is the fallback. Another
-        agent's flagged entry is invisible — that content lives in a
-        transcript this agent never saw.
+    def record_load(self, path: str, content_hash: str, reason: str, trigger: str) -> None:
+        """Record an instruction file Claude Code reported loading.
 
         Args:
-            path (str): Memory-file path to look up.
+            path (str): Canonical instruction-file path.
+            content_hash (str): Its content hash at load time.
+            reason (str): The `load_reason` from the hook input.
+            trigger (str): Raw `trigger_file_path`, or `""`.
         """
-        entry = self.entries.get(path)
-        if entry is not None:
-            return entry
-        h = self._flagged.get((path, self.scope))
-        if h is not None:
-            return {"h": h, "k": KIND_FLAGGED}
-        return None
+        meta = {"h": content_hash, "r": reason, "g": trigger}
+        if self.loads.get(path) == meta:
+            return
+        self.loads[path] = meta
+        self._appends.append(
+            {"t": "load", "p": path, "h": content_hash, "r": reason, "g": trigger}
+        )
 
-    def record(self, path: str, content_hash: str, kind: str) -> None:
-        """Record a path/hash/kind, buffering an append if it changes state.
-
-        No-ops when the ledger already holds the same hash at an equal or
-        higher kind rank, so steady-state hook runs append nothing.
-        ``flagged`` records are stored under the current agent scope.
+    def record_flag(self, path: str, content_hash: str, agent: str) -> None:
+        """Record that an agent was told to read an instruction file.
 
         Args:
-            path (str): Memory-file path.
-            content_hash (str): Content hash of the file.
-            kind (str): One of the ledger kinds.
+            path (str): Canonical instruction-file path.
+            content_hash (str): Its content hash when flagged.
+            agent (str): The `agent_id` that was told.
         """
-        existing_global = self.entries.get(path)
-        if kind == KIND_FLAGGED:
-            if existing_global and existing_global["h"] != content_hash:
-                # Keep the global entry tracking latest disk content, or a
-                # stale global hash would re-trigger discovery every run.
-                self.entries[path] = {
-                    "h": content_hash, "k": existing_global["k"],
-                }
-                self._pending.append({
-                    "p": path, "h": content_hash, "k": existing_global["k"],
-                })
-            if existing_global and existing_global["h"] == content_hash:
-                # Content is already covered natively; nothing to scope.
+        if self.flags.get((path, agent)) == content_hash:
+            return
+        self.flags[(path, agent)] = content_hash
+        record = {"t": "flag", "p": path, "h": content_hash}
+        if agent:
+            record["a"] = agent
+        self._appends.append(record)
+
+    def note_trigger(self, raw_path: str, agent: str) -> None:
+        """Index a raw tool-input path against the agent that touched it.
+
+        Only subagent touches are indexed: an unindexed trigger resolves
+        to the main agent, which is the correct default and keeps the
+        index small in normal sessions.
+
+        Args:
+            raw_path (str): `tool_input.file_path` exactly as the tool
+                received it — `InstructionsLoaded` echoes this spelling in
+                `trigger_file_path`, so the join must not normalize.
+            agent (str): The `agent_id` from the tool event.
+        """
+        if not agent or not raw_path or self.trig.get(raw_path) == agent:
+            return
+        self.trig[raw_path] = agent
+        if len(self.trig) > TRIG_MAX:
+            for key in list(self.trig)[: len(self.trig) - TRIG_MAX]:
+                del self.trig[key]
+        self._pending_dirty = True
+
+    def suspect(self, directory: str, agent: str, now: float | None = None) -> None:
+        """Record a directory a Bash command touched, pending its grace window.
+
+        Args:
+            directory (str): Canonical directory path.
+            agent (str): The `agent_id` that touched it.
+            now (float | None): Epoch seconds, injectable for tests.
+        """
+        now = time.time() if now is None else now
+        for entry in self.susp:
+            if entry[0] == directory and entry[1] == agent:
                 return
-            if self._flagged.get((path, self.scope)) != content_hash:
-                self._flagged[(path, self.scope)] = content_hash
-                record = {"p": path, "h": content_hash, "k": kind}
-                if self.scope:
-                    record["a"] = self.scope
-                self._pending.append(record)
-            self.known_hashes().add(content_hash)
-            return
+        self.susp.append([directory, agent, now])
+        if len(self.susp) > SUSP_MAX:
+            self.susp = self.susp[-SUSP_MAX:]
+        self._pending_dirty = True
 
-        if (
-            existing_global
-            and existing_global["h"] == content_hash
-            and _KIND_RANK[existing_global["k"]] >= _KIND_RANK[kind]
-        ):
-            return
-        self.entries[path] = {"h": content_hash, "k": kind}
-        self.known_hashes().add(content_hash)
-        self._pending.append({"p": path, "h": content_hash, "k": kind})
+    def take_due(self, force: bool, now: float | None = None) -> list[tuple[str, str]]:
+        """Remove and return suspicions whose grace window has elapsed.
 
-    def mark_seeded(self) -> None:
-        """Buffer the seeded marker."""
-        if not self.seeded:
-            self.seeded = True
-            self._pending.append({SEEDED_MARKER: True})
+        Args:
+            force (bool): Take every suspicion regardless of age. Used at
+                turn boundaries, where all async loads have landed.
+            now (float | None): Epoch seconds, injectable for tests.
+
+        Returns:
+            list[tuple[str, str]]: `(directory, agent)` pairs to check.
+        """
+        now = time.time() if now is None else now
+        due, keep = [], []
+        for directory, agent, ts in self.susp:
+            if force or now - ts >= GRACE_SECS:
+                due.append((directory, agent))
+            else:
+                keep.append([directory, agent, ts])
+        if len(keep) != len(self.susp):
+            self.susp = keep
+            self._pending_dirty = True
+        return due
+
+    def set_cwd(self, cwd: str) -> bool:
+        """Update the recorded working directory.
+
+        Args:
+            cwd (str): Canonical working directory.
+
+        Returns:
+            bool: `True` when this is a change from the previous value.
+        """
+        if self.cwd == cwd:
+            return False
+        changed = bool(self.cwd)
+        self.cwd = cwd
+        self._pending_dirty = True
+        return changed
+
+    def drop_lazy_loads(self) -> list[str]:
+        """Forget lazily loaded files, e.g. after a worktree switch.
+
+        `ExitWorktree` clears Claude Code's memory-file caches, and
+        `EnterWorktree` moves the session into a different checkout, so
+        nested loads recorded against the old tree no longer describe
+        what is in context. Session-wide loads survive.
+
+        Returns:
+            list[str]: The paths forgotten.
+        """
+        dropped = [
+            path
+            for path, meta in self.loads.items()
+            if meta.get("r") not in GLOBAL_LOAD_REASONS
+        ]
+        for path in dropped:
+            del self.loads[path]
+            self._appends.append({"t": "unload", "p": path})
+        for path, agent in list(self.flags):
+            del self.flags[(path, agent)]
+            record = {"t": "unflag", "p": path}
+            if agent:
+                record["a"] = agent
+            self._appends.append(record)
+        return dropped
+
+    def drop_flags(self) -> list[str]:
+        """Forget plugin-flagged files, e.g. after compaction.
+
+        A flagged file entered context only through the transcript, which
+        compaction drops. Natively loaded files are re-reported by Claude
+        Code with `load_reason` `compact`, so they are left alone.
+
+        Returns:
+            list[str]: The paths forgotten.
+        """
+        dropped = sorted({path for path, _ in self.flags})
+        for path, agent in list(self.flags):
+            del self.flags[(path, agent)]
+            record = {"t": "unflag", "p": path}
+            if agent:
+                record["a"] = agent
+            self._appends.append(record)
+        return dropped
 
     def flush(self) -> None:
-        """Write any buffered records to disk."""
-        append_entries(self.path, self._pending)
-        self._pending = []
+        """Persist buffered ledger appends and rewritten scratch state."""
+        if self._appends:
+            payload = "".join(
+                json.dumps(r, separators=(",", ":")) + "\n" for r in self._appends
+            )
+            with open(self.ledger, "a") as fh:
+                fh.write(payload)
+            os.chmod(self.ledger, 0o600)
+            self._appends = []
+        if self._pending_dirty:
+            _write_atomic(
+                self.pending,
+                json.dumps(
+                    {"susp": self.susp, "trig": self.trig, "cwd": self.cwd},
+                    separators=(",", ":"),
+                ),
+            )
+            self._pending_dirty = False
 
 
-def scan_project(cwd: str) -> tuple[list[str], str, bool]:
-    """Enumerate memory files under a project tree.
+_REDIRECT_PREFIX = re.compile(r"^[0-9]*[<>]+&?")
 
-    Uses `git ls-files` when available (fast, respects .gitignore, and in
-    a worktree lists exactly that worktree's checkout). Falls back to a
-    bounded `os.walk` that prunes hidden and dependency directories and
-    gives up past `SCAN_MAX_DIRS` directories or the time budget.
+
+def _clean_token(token: str) -> str:
+    """Strip shell punctuation that can be glued onto a path token.
+
+    Handles `>out.txt`, `2>>log`, `--file=path`, and trailing separators
+    left by `shlex` on constructs like `cmd;`.
 
     Args:
-        cwd (str): Project root to scan.
+        token (str): A raw token from `shlex.split`.
 
     Returns:
-        tuple[list[str], str, bool]: Absolute paths of memory files found
-            under `cwd`, the scan method (`git`, `walk`, or `skipped`),
-            and whether the walk was truncated by its bounds (a truncated
-            scan means missing suppression hashes, which shows up later
-            as unexpected flags — worth surfacing in diagnostics).
+        str: The token's path-like remainder, possibly empty.
     """
-    if cwd == "/":
-        return [], "skipped", False
-
-    names = set(memory_basenames())
-
-    found = _scan_via_git(cwd, names)
-    if found is not None:
-        return found, "git", False
-
-    found, truncated = _scan_via_walk(cwd, names)
-    return found, "walk", truncated
+    token = token.strip().strip("'\"")
+    token = _REDIRECT_PREFIX.sub("", token).strip()
+    if token.startswith("--") and "=" in token:
+        token = token.split("=", 1)[1]
+    # Quotes can survive on either side of the redirect strip, and again
+    # when shlex bailed out and the caller fell back to whitespace
+    # splitting, which does no quote processing at all.
+    return token.strip("'\"").rstrip(";&|")
 
 
-def _scan_via_git(cwd: str, names: set[str]) -> list[str] | None:
-    """List memory files via git, or `None` when git can't answer.
+def bash_directories(command: str, cwd: str) -> list[str]:
+    """Extract directories a Bash command plausibly touched.
+
+    Best-effort by construction: shell is not parsed, only tokenized.
+    Tokens are resolved against `cwd` when relative, which is what makes
+    the common `sed -n 1,5p pkg/mod.py` form visible at all, and kept only
+    when they (or their parent) exist on disk — which discards flags,
+    `sed` scripts, and heredoc body text without special-casing them.
+
+    Failure is asymmetric and deliberately so: a missed path leaves the
+    session exactly where it would be without the plugin, while a spurious
+    one costs at most one unnecessary instruction file.
 
     Args:
-        cwd (str): Project root to scan.
-        names (set[str]): Memory-file basenames to match.
+        command (str): The raw Bash command string.
+        cwd (str): Canonical working directory for relative resolution.
+
+    Returns:
+        list[str]: Canonical directory paths, de-duplicated, order kept.
     """
-    patterns = [f"*{name}" for name in names]
+    if not command:
+        return []
     try:
-        proc = subprocess.run(
-            ["git", "-C", cwd, "ls-files", "-z", "--cached", "--others",
-             "--exclude-standard", "--", *patterns],
-            capture_output=True,
-            timeout=GIT_TIMEOUT_SECS,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
+        tokens = shlex.split(command, comments=True)
+    except ValueError:
+        # Unbalanced quotes: fall back to whitespace splitting rather than
+        # giving up, since a malformed quote elsewhere in a long command
+        # should not blind the whole call.
+        tokens = command.split()
 
-    found = []
-    for rel in proc.stdout.decode("utf-8", "replace").split("\0"):
-        if rel and os.path.basename(rel) in names:
-            path = os.path.join(cwd, rel)
-            if os.path.isfile(path):
-                found.append(path)
-    return found
+    dirs: list[str] = []
+    seen: set[str] = set()
+    for token in tokens[:BASH_MAX_CANDIDATES * 4]:
+        token = _clean_token(token)
+        if not token or token.startswith("-"):
+            continue
+        if token.startswith("~"):
+            token = os.path.expanduser(token)
+        if not token.startswith("/"):
+            if "/" not in token and "." not in token:
+                # Bare words are overwhelmingly subcommands and operands,
+                # not paths; requiring a separator or extension keeps
+                # `git status` from resolving `status` against cwd.
+                continue
+            token = os.path.join(cwd, token)
+
+        try:
+            if os.path.isdir(token):
+                directory = token
+            elif os.path.exists(token) or os.path.isdir(os.path.dirname(token)):
+                directory = os.path.dirname(token)
+            else:
+                continue
+        except OSError:
+            continue
+
+        directory = canon(directory)
+        if directory not in seen:
+            seen.add(directory)
+            dirs.append(directory)
+        if len(dirs) >= BASH_MAX_CANDIDATES:
+            break
+    return dirs
 
 
-def _scan_via_walk(cwd: str, names: set[str]) -> tuple[list[str], bool]:
-    """List memory files via a bounded directory walk.
+def candidate_files(
+    directory: str, cwd: str, ignored: tuple[str, ...]
+) -> list[str]:
+    """Collect instruction files that a touch at `directory` should load.
+
+    Walks from `directory` upward the way Claude Code's own nested
+    traversal does, stopping at any strict ancestor of `cwd` — those were
+    loaded at session start and are already reported by
+    `InstructionsLoaded`. Per directory, `CLAUDE.md` and `CLAUDE.local.md`
+    both count (Claude Code loads both); `AGENTS.md` counts only where no
+    `CLAUDE.md` sits beside it, since Claude Code never loads it natively.
 
     Args:
-        cwd (str): Project root to scan.
-        names (set[str]): Memory-file basenames to match.
+        directory (str): Canonical directory that was touched.
+        cwd (str): Canonical session working directory.
+        ignored (tuple[str, ...]): Ignored path prefixes.
 
     Returns:
-        tuple[list[str], bool]: Paths found and whether the walk stopped
-            early on the directory cap or time budget.
+        list[str]: Canonical instruction-file paths, nearest first.
     """
+    config = config_dir()
+    names = memory_basenames()
     found: list[str] = []
-    deadline = time.monotonic() + SCAN_TIME_BUDGET_SECS
-    visited = 0
-    truncated = False
-    for root, dirs, files in os.walk(cwd):
-        visited += 1
-        if visited > SCAN_MAX_DIRS or time.monotonic() > deadline:
-            truncated = True
+    current = directory
+    for _ in range(WALK_MAX_DEPTH):
+        if current != cwd and cwd.startswith(current + "/"):
             break
-        dirs[:] = [
-            d for d in dirs
-            if not d.startswith(".") and d not in SCAN_PRUNE_NAMES
-        ]
-        for name in names:
-            if name in files:
-                found.append(os.path.join(root, name))
-    return found, truncated
-
-
-def seed_session(ledger: Ledger, cwd: str) -> dict:
-    """Seed a fresh ledger with everything already known at session start.
-
-    Records ancestor CLAUDE.md files (loaded by Claude Code's startup walk)
-    and the global user memory as ``context``, and every memory file found
-    under `cwd` as ``equiv`` so byte-identical copies outside the project
-    (worktrees, sibling clones) never flag.
-
-    Args:
-        ledger (Ledger): The session ledger.
-        cwd (str): Canonicalized project working directory.
-
-    Returns:
-        dict: Seed statistics for diagnostics (ancestor and project-file
-            counts, scan method, truncation).
-    """
-    ignored = ignored_prefixes()
-    ancestors = 0
-    project_files = 0
-
-    for path in ancestor_memory_files(cwd):
-        h = hash_file(path)
-        if h and not is_ignored(path, ignored):
-            ledger.record(path, h, KIND_CONTEXT)
-            ancestors += 1
-
-    global_memory = os.path.join(config_dir(), "CLAUDE.md")
-    h = hash_file(global_memory)
-    if h and not is_ignored(global_memory, ignored):
-        ledger.record(global_memory, h, KIND_CONTEXT)
-
-    scanned, method, truncated = scan_project(cwd)
-    for path in scanned:
-        h = hash_file(path)
-        if h and not is_ignored(path, ignored):
-            ledger.record(path, h, KIND_EQUIV)
-            project_files += 1
-
-    ledger.mark_seeded()
-    return {
-        "cwd": cwd,
-        "ancestors": ancestors,
-        "project_files": project_files,
-        "scan_method": method,
-        "scan_truncated": truncated,
-    }
-
-
-def ancestor_memory_files(cwd: str) -> list[str]:
-    """Return existing CLAUDE.md paths at `cwd` and every ancestor.
-
-    Only CLAUDE.md participates: it is what Claude Code's startup walk
-    actually loads.
-
-    Args:
-        cwd (str): Canonicalized project working directory.
-
-    Returns:
-        list[str]: Existing ancestor CLAUDE.md paths, nearest first.
-    """
-    found = []
-    current = cwd
-    while True:
-        candidate = os.path.join(current, "CLAUDE.md")
-        if os.path.isfile(candidate):
-            found.append(candidate)
-        if current == "/":
+        if not (current == config or current.startswith(config + "/")):
+            has_claude = False
+            for name in names:
+                path = os.path.join(current, name)
+                if name == "AGENTS.md" and has_claude:
+                    continue
+                if not os.path.isfile(path) or is_ignored(path, ignored):
+                    continue
+                if name in CLAUDE_BASENAMES:
+                    has_claude = True
+                found.append(path)
+        if current == "/" or current == cwd:
             break
-        current = os.path.dirname(current) or "/"
+        parent = os.path.dirname(current) or "/"
+        if parent == current:
+            break
+        current = parent
     return found
 
 
-def gc_state(now: float | None = None) -> tuple[int, int]:
-    """Delete stale session state (ledgers and logs) and legacy files.
-
-    Sessions that crash or never fire SessionEnd leave state behind;
-    anything untouched for `STATE_MAX_AGE_DAYS` is dead. Also sweeps the
-    pre-0.3 `claude-md-seen-*` files out of `TMPDIR`.
+def build_message(paths: list[str], changed: list[str] | None = None) -> str:
+    """Build the instruction injected for unloaded or stale files.
 
     Args:
-        now (float | None): Current epoch seconds, injectable for tests.
+        paths (list[str]): Instruction files the agent has not seen.
+        changed (list[str] | None): Loaded files whose content changed on
+            disk since it entered context.
 
     Returns:
-        tuple[int, int]: Count of state files and legacy files removed.
+        str: The message to inject as additional context.
+    """
+    sections = []
+    if len(paths) == 1:
+        sections.append(
+            "IMPORTANT: You must use the Read tool to read the CLAUDE.md "
+            f"here: {paths[0]}"
+        )
+    elif paths:
+        listing = "\n".join(f"  - {path}" for path in paths)
+        sections.append(
+            "IMPORTANT: You must use the Read tool to read each of these "
+            "instruction files:\n"
+            f"{listing}"
+        )
+    if changed:
+        listing = "\n".join(f"  - {path}" for path in changed)
+        plural = "files have" if len(changed) > 1 else "file has"
+        sections.append(
+            f"The following instruction {plural} changed on disk since the "
+            "content was loaded into your context. IMPORTANT: You must "
+            "re-read them with the Read tool — what you are holding is "
+            f"stale.\n{listing}"
+        )
+    head = "\n\n".join(sections)
+    return (
+        "<claude-md-discovery-extended>\n"
+        f"{head}\n"
+        "\n"
+        "This is a user-installed hook which detects CLAUDE.md files that "
+        "do not load because Claude Code cannot tell which directories you "
+        "are looking at when you use the Bash tool for file operations. Do "
+        "not change how you are working. This hook will continue to monitor "
+        "and will notify you again if any other CLAUDE.md you have not read "
+        "appears; it will not notify you about ones already loaded. These "
+        "instructions are non-negotiable.\n"
+        "\n"
+        "If a file references other files via @path imports, read those too "
+        "— imports are only auto-resolved for natively loaded memory files, "
+        "not for files you read yourself.\n"
+        "\n"
+        "Once you have read them, continue your current task. Do NOT stop to "
+        "tell the user you have read them.\n"
+        "</claude-md-discovery-extended>"
+    )
+
+
+def gc_state(now: float | None = None) -> int:
+    """Delete state from sessions that never ended cleanly.
+
+    Args:
+        now (float | None): Epoch seconds, injectable for tests.
+
+    Returns:
+        int: Count of files removed.
     """
     now = time.time() if now is None else now
-    state_removed = 0
-    legacy_removed = 0
-
-    sdir = state_dir()
     cutoff = now - STATE_MAX_AGE_DAYS * 86400
+    removed = 0
     try:
+        sdir = state_dir()
         for name in os.listdir(sdir):
             path = os.path.join(sdir, name)
             try:
                 if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
                     os.unlink(path)
-                    state_removed += 1
+                    removed += 1
             except OSError:
                 continue
     except OSError:
         pass
+    return removed
 
-    tmpdir = os.environ.get("TMPDIR", "/tmp")
-    legacy_cutoff = now - LEGACY_MAX_AGE_DAYS * 86400
-    try:
-        for name in os.listdir(tmpdir):
-            if not name.startswith("claude-md-seen-"):
-                continue
-            path = os.path.join(tmpdir, name)
-            try:
-                if os.path.isfile(path) and os.path.getmtime(path) < legacy_cutoff:
-                    os.unlink(path)
-                    legacy_removed += 1
-            except OSError:
-                continue
-    except OSError:
-        pass
 
-    return state_removed, legacy_removed
+def drop_session(session_id: str) -> None:
+    """Delete every state file for a session.
+
+    Args:
+        session_id (str): The Claude Code session identifier.
+    """
+    for path in (
+        ledger_path(session_id),
+        pending_path(session_id),
+        log_path(session_id),
+    ):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def detect_changes(state: "State", agent: str, ignored: tuple[str, ...]) -> list[str]:
+    """Find loaded instruction files whose content changed on disk.
+
+    Claude Code loads a memory file once and never reloads it, so editing
+    a CLAUDE.md while a session runs leaves the session working from the
+    old rules with no indication. Re-hashing at the turn boundary closes
+    that window. A file whose new content is already in context (an edit
+    that converged on another known file) is updated silently.
+
+    Args:
+        state (State): The session state.
+        agent (str): The `agent_id` whose view to check.
+        ignored (tuple[str, ...]): Ignored path prefixes.
+
+    Returns:
+        list[str]: Paths whose content changed since they were loaded.
+    """
+    changed: list[str] = []
+    known = state.known_hashes(agent)
+    for path, meta in list(state.loads.items()):
+        if not state.visible_to(meta, agent) or is_ignored(path, ignored):
+            continue
+        content_hash = hash_file(path)
+        if not content_hash or content_hash == meta["h"]:
+            continue
+        if content_hash not in known:
+            changed.append(path)
+        state.record_load(path, content_hash, meta["r"], meta["g"])
+    return changed
+
+
+def seed_root(state: "State", root: str) -> None:
+    """Record the session root's own instruction files as loaded.
+
+    Claude Code always loads these at startup. Asserting it costs two
+    `stat` calls and closes the only gap where a natively loaded file
+    could be flagged: the upward walk stops *above* the session root, so
+    the root's own files are the sole natively loaded candidates the
+    plugin ever examines.
+
+    Args:
+        state (State): The session state.
+        root (str): Canonical session working directory.
+    """
+    ignored = ignored_prefixes()
+    relatives = CLAUDE_BASENAMES + tuple(
+        os.path.join(".claude", name) for name in CLAUDE_BASENAMES
+    )
+    for relative in relatives:
+        path = os.path.join(root, relative)
+        if is_ignored(path, ignored):
+            continue
+        content_hash = hash_file(path)
+        if content_hash:
+            state.record_load(path, content_hash, "session_start", "")
+
+
+def resolve_pending(
+    state: State,
+    cwd: str,
+    ignored: tuple[str, ...],
+    force: bool = False,
+    now: float | None = None,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Turn matured suspicions into the set of files worth flagging.
+
+    Args:
+        state (State): The session state.
+        cwd (str): Canonical session working directory.
+        ignored (tuple[str, ...]): Ignored path prefixes.
+        force (bool): Ignore the grace window (turn boundaries).
+        now (float | None): Epoch seconds, injectable for tests.
+
+    Returns:
+        tuple: `(flagged, suppressed)` — canonical paths to tell the agent
+            about, and `(candidate, matched)` pairs suppressed by a content
+            hash already in that agent's context, for diagnostics.
+    """
+    flagged: list[str] = []
+    suppressed: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for directory, agent in state.take_due(force, now):
+        if is_ignored(directory, ignored):
+            continue
+        known = state.known_hashes(agent)
+        for path in candidate_files(directory, cwd, ignored):
+            if path in seen or state.is_known(path, agent):
+                continue
+            content_hash = hash_file(path)
+            if not content_hash:
+                continue
+            if content_hash in known:
+                suppressed.append(
+                    (path, state.path_for_hash(content_hash, agent) or "")
+                )
+                # Recorded as flagged so an identical copy is not
+                # re-examined on every future touch of the same tree.
+                state.record_flag(path, content_hash, agent)
+                continue
+            seen.add(path)
+            flagged.append(path)
+            known.add(content_hash)
+            state.record_flag(path, content_hash, agent)
+
+    return flagged, suppressed

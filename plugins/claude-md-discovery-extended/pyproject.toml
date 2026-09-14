@@ -1,7 +1,7 @@
 [project]
 name = "claude-md-discovery-extended"
-version = "0.4.0"
-description = "Extends CLAUDE.md auto-discovery to directories outside the project tree, with content-hash deduplication and change detection"
+version = "0.5.0"
+description = "Flags CLAUDE.md files that never reached the context window, tracking what Claude Code actually loaded via the InstructionsLoaded hook"
 requires-python = ">=3.10"
 dependencies = []
 

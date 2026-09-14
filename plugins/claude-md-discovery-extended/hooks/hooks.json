@@ -1,5 +1,5 @@
 {
-  "description": "Detects CLAUDE.md/AGENTS.md files outside the project tree when Claude accesses files there, deduplicates by content hash (worktrees, clones, copied templates stay silent), and nudges a re-read when a loaded instruction file changes on disk.",
+  "description": "Flags CLAUDE.md files that never made it into context. Claude Code loads a nested CLAUDE.md only when a file tool reaches its directory, so Bash operations (cat, sed, grep, in-place edits) silently bypass it. Tracks what Claude Code actually loaded via InstructionsLoaded, watches Bash and cd for directories it missed, and tells Claude to read the difference.",
   "hooks": {
     "SessionStart": [
       {
@@ -18,25 +18,47 @@
         ]
       }
     ],
+    "InstructionsLoaded": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/on_instructions_loaded.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/on_tool_batch.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/on_cwd_changed.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/user_prompt_check.py",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Read|Glob|Grep|Edit|Write|Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/check_claude_md.py",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/on_prompt.py",
             "timeout": 10
           }
         ]

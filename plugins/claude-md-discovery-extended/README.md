@@ -1,135 +1,101 @@
 # claude-md-discovery-extended
 
-A Claude Code plugin that fills a gap in `CLAUDE.md` auto-discovery. Claude Code has built-in discovery for some directory relationships but not all. This plugin covers what Claude Code doesn't: sibling directories, cousin directories, or completely unrelated trees. Discovery happens on demand when the model accesses files in those directories, is deduplicated by **content hash** (so git worktrees, extra clones, and copied templates never re-flag instructions already known), and nudges the model to re-read an instruction file when it changes on disk mid-session.
+Claude Code loads a nested `CLAUDE.md` when a **file tool** reaches into its directory. A **Bash** command reaching the same directory loads nothing. If you work mostly through `cat`, `sed`, `grep`, and in-place shell edits — which agents increasingly do — your nested instruction files silently never enter the context window.
 
-**Example directory relationships:**
+This plugin closes that gap. It tracks what Claude Code *actually* loaded, watches Bash and `cd` for directories Claude Code missed, and tells Claude to read the difference.
 
-```text
-grandparent/
-  parent/
-    projectA/  ← your project
-    projectB/  ← sibling
-  tools/
-    linter/    ← cousin
-other-team/
-  services/
-    api/       ← unrelated tree
-```
+## The gap, measured
 
-## Background
-
-Claude Code loads `CLAUDE.md` files from three sources:
-
-1. **Ancestor directories**: at launch, Claude Code walks up from the working directory and loads every `CLAUDE.md` it finds.
-2. **Child directories**: when the model reads a file in a subdirectory, Claude Code loads any `CLAUDE.md` along that subdirectory's path.
-3. **Explicit directories**: passing `--add-dir` at launch with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` loads `CLAUDE.md` files from specified directories at startup.
-
-See the [CLAUDE.md docs](https://code.claude.com/docs/en/memory) for full details.
-
-None of these cover directories outside the ancestor/child path discovered mid-session. If you launch in `projectA`:
+A probe session in a fixture repo with a `CLAUDE.md` in three sibling directories, one access each:
 
 ```text
-grandparent/
-  CLAUDE.md           <- loaded (ancestor)
-  parent/
-    projectA/         <- your project (cwd)
-      CLAUDE.md       <- loaded (project root)
-      src/
-        CLAUDE.md     <- loaded (child, on demand)
-    projectB/
-      CLAUDE.md       <- NOT loaded
-    projectC/
-      CLAUDE.md       <- NOT loaded
-  tools/
-    linter/
-      CLAUDE.md       <- NOT loaded
-other-team/
-  services/
-    api/
-      CLAUDE.md       <- NOT loaded
+TOOL Read   repo/readdir/target_read.py
+TOOL Bash   cat repo/catdir/target_cat.py
+TOOL Bash   grep -rn needle repo/greponly
+IL  nested_traversal  repo/readdir/CLAUDE.md   trigger=repo/readdir/target_read.py
 ```
 
-Every `CLAUDE.md` outside the ancestor/child path won't be auto-loaded. The model can still read them manually, but it almost never will on its own, so you'd have to stop it and tell it to. This plugin handles that automatically.
+One `InstructionsLoaded` event. `catdir/CLAUDE.md` and `greponly/CLAUDE.md` never loaded. A `cd` into a directory is no better: the session's working directory moved into `greponly/` and its `CLAUDE.md` still never loaded.
 
-`--add-dir` can solve this, but it loads everything at startup. You need to know which directories matter ahead of time, specify them every session, and their `CLAUDE.md` contents occupy the context window from the start whether they end up being relevant or not. This plugin takes a [progressive disclosure](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) approach instead: `CLAUDE.md` files are discovered and loaded on demand as the model accesses files in those directories, keeping the context window lean until the instructions are actually needed.
+## How it works
 
-## How It Works
+### What's loaded is observed, not inferred
 
-Each session keeps a ledger of every instruction file whose content is known, recorded as a path plus a SHA-256 content hash:
+The [`InstructionsLoaded`](https://code.claude.com/docs/en/hooks#instructionsloaded) hook fires once per instruction file Claude Code loads, reporting `file_path`, `memory_type` (`User` / `Project` / `Local` / `Managed`), `load_reason`, and for lazy loads the `trigger_file_path` that caused it. That is ground truth, and it is the plugin's only source for "in context."
 
-- **Ancestor `CLAUDE.md` files** and the **global user memory** (`~/.claude/CLAUDE.md`), loaded by Claude Code at startup.
-- **Project-subtree `CLAUDE.md` files** as Claude Code loads them on demand.
-- **Every instruction file inside the project tree**, found by a scan at session start (via `git ls-files` when available, so it's fast and respects `.gitignore`; a bounded directory walk otherwise). These count as "known content" for deduplication even before they're loaded.
-- **Files the plugin flagged** and **files the model read or wrote directly** (`Read`, `Write`, `Edit`, or a Bash `cat`).
+This covers things a hand-rolled ancestor walk gets wrong: `.claude/rules/*.md` (including `paths:`-scoped rules, which arrive as `path_glob_match`), `CLAUDE.local.md`, `.claude/CLAUDE.md`, `@path` import expansion, managed-policy files, and the re-injection that follows compaction.
 
-When the model accesses a path outside the project tree, the plugin walks up the directory tree collecting instruction files and flags only the ones whose **content hash matches nothing in the ledger**. Suppression is by content, not path, which handles:
+### Bash directories are the only guess
 
-- **Git worktrees** — a session in `repo/.worktrees/foo` that touches the main checkout won't be told to re-read `CLAUDE.md` files byte-identical to the worktree's own. If a copy diverged (different branch, different rules), it still flags — the instructions genuinely differ.
-- **Multiple clones** of the same repository.
-- **Copied templates** — identical `CLAUDE.md` files stamped across sibling projects flag once, not N times.
+For a `Bash` call, the plugin tokenizes the command and keeps tokens that resolve to something on disk — absolute, `~`-prefixed, or **relative to the session's working directory**. Everything else (flags, `sed` scripts, bare subcommands, heredoc text) falls away because it doesn't resolve.
 
-### Change detection
+This is best-effort by construction, and the failure modes are asymmetric on purpose:
 
-Claude Code loads memory files once and never reloads them mid-session. The plugin tracks content hashes, so when a previously-loaded instruction file changes on disk — you edited the project `CLAUDE.md` while the model worked — the model gets a single nudge to re-read it. Changes the model itself makes via `Write`/`Edit` don't trigger the nudge (that content is already in its context). An ancestor `CLAUDE.md` created after session start (which the startup walk never saw) is flagged as a fresh discovery.
+- **Missed path** → silence, which is exactly where you'd be without the plugin. No regression.
+- **Spurious path** → one instruction file you didn't strictly need. Cheap.
 
-Detection runs at two trigger points: on every tool call (for the paths being touched, plus the ancestor chain), and at each **turn boundary** via a `UserPromptSubmit` hook — so an edit made while the model idled is caught even when the next turn involves no tool calls. The turn-boundary check covers ancestors, the global memory, and in-project files already loaded; outside-the-project files are only re-checked when the model actually touches their tree again.
+`CwdChanged` covers the `cd`-then-work pattern with no parsing at all: `new_cwd` is exact.
 
-### Subagents
+### Nothing is emitted synchronously
 
-Subagent tool calls fire the same hooks with an `agent_id` in the hook input, and a subagent's transcript is a separate context from the main agent's. The ledger accounts for this: disk-derived knowledge (ancestors, the project scan, hash equivalence) is session-global, but *transcript-carried* knowledge — files the plugin flagged or the model read directly — is scoped per agent. A CLAUDE.md discovered inside a subagent nudges that subagent, and does not suppress the discovery for the main agent (or other subagents), which never saw it. Known limitation: the built-in Explore/Plan agents skip CLAUDE.md loading entirely, and the plugin doesn't special-case them.
+`InstructionsLoaded` is asynchronous. Measured latencies ranged from 0.03s to 4.5s, and one event arrived **24ms after the `PostToolBatch` for the very batch that caused it**. A `Bash` call touching the same directory as a `Read` in the same batch would therefore be flagged while Claude Code was still loading the file.
 
-### Context lifecycle awareness
+So a Bash touch records a *suspicion*, and suspicions are only emitted once they outlive a grace window (`PostToolBatch`) or at a turn boundary where every async load has certainly landed (`UserPromptSubmit`). Findings arrive as `additionalContext` — `PostToolUse`-family exit code 2 isn't honored, and nothing here should block anything.
 
-- **`/clear`** wipes the context, so the session ledger is reset and discovery starts fresh.
-- **Compaction** drops content that only lived in the transcript. Files the plugin flagged are demoted so they re-flag on next relevant access; natively-loaded files (which Claude Code re-injects or reloads on demand) stay suppressed.
-- **Resume** keeps the ledger, so a resumed session doesn't get re-nagged about files already in its restored context.
+### Deduplication by content
 
-### AGENTS.md
+Suppression is by content hash, not path, so byte-identical copies across git worktrees, extra clones, and copied templates flag once rather than N times. Only content Claude Code reported loading (or that the plugin already flagged) can suppress — a file merely sitting on disk never does.
 
-Claude Code does **not** natively load `AGENTS.md`. For directories outside the project tree, the plugin flags `AGENTS.md` when there's no `CLAUDE.md` beside it, so repos that standardized on `AGENTS.md` still surface their instructions. Inside your own project tree the plugin stays out of the way (that setup is your call — use `@AGENTS.md` imports there). Set `CLAUDE_MD_DISCOVERY_AGENTS_MD=0` to disable.
+### Per-agent scoping
 
-### Hooks
+`InstructionsLoaded` carries no `agent_id` even when a subagent's tool call caused the load, but tool events do, and `trigger_file_path` matches the triggering tool's `tool_input.file_path` byte for byte. The plugin joins on that to recover attribution, resolving it lazily at emit time so it doesn't matter whether the load or the tool batch is recorded first.
 
-Four [hooks](https://code.claude.com/docs/en/hooks):
+A file loaded inside a subagent therefore doesn't suppress discovery for the main agent, which never saw it. Loads with reason `session_start` or `compact` are treated as visible to every agent.
 
-- **PostToolUse** (matcher: `Read|Glob|Grep|Edit|Write|Bash`): updates the ledger and reports new or changed instruction files. For the Bash tool, paths are extracted from the command string using `shlex` tokenization.
-- **UserPromptSubmit**: turn-boundary staleness check — re-hashes loaded instruction files and injects a re-read nudge (as context, never blocking the prompt) when something changed while the model idled.
-- **SessionStart**: verifies `python3` is available, seeds the ledger (ancestors, global memory, project scan), handles `/clear` and compaction, and garbage-collects stale state.
-- **SessionEnd**: deletes the ledger on `/clear`; keeps it otherwise so resumed sessions don't re-flag.
+### Staleness
 
-State lives under `~/.claude/plugin-state/claude-md-discovery-extended/` (one small JSONL file per session) rather than `/tmp`, so it survives reboots and macOS's periodic tmp cleanup. Files from sessions that never ended cleanly are garbage-collected after 30 days.
+Claude Code loads a memory file once and never reloads it, so editing a `CLAUDE.md` mid-session leaves the model working from rules it can no longer see. Every loaded file is re-hashed at each turn boundary and a change produces one re-read nudge. Edits Claude makes itself through `Write`/`Edit` don't nag — that content is already in its context.
 
-### Imports
+### Lifecycle
 
-`@path` imports inside memory files are only auto-resolved by Claude Code for files it loads natively. A flagged file is read by the model directly, so its imports don't expand — the discovery message explicitly tells the model to follow any `@path` references it finds.
+- **`/clear`** wipes the context, so all state is deleted; Claude Code re-fires `session_start` loads, which reseeds it for free.
+- **Compaction** drops transcript-only content, so plugin-flagged files are forgotten and may re-flag. Natively loaded files are re-reported with `load_reason: compact`.
+- **Worktree switches** (`EnterWorktree` / `ExitWorktree`) clear Claude Code's memory-file caches and move the session into a different checkout, so lazily loaded files are forgotten. Detected by tool name, not by a `cwd` change — a plain `cd` moves `cwd` too and must not invalidate anything.
+- **Resume** keeps state, so a resumed session isn't re-nagged about files in its restored context.
+
+## Hooks
+
+| Event | Role |
+| :--- | :--- |
+| `InstructionsLoaded` | Records every file Claude Code loaded. The only writer of "in context." |
+| `PostToolBatch` | Extracts Bash directories, indexes triggers for agent attribution, emits matured findings. Once per batch, not per tool. |
+| `CwdChanged` | Records a `cd` destination as touched. |
+| `UserPromptSubmit` | Turn-boundary flush: emits every pending finding and runs the staleness check. |
+| `SessionStart` | Anchors the session root, handles `/clear` and compaction, garbage-collects abandoned state. |
+| `SessionEnd` | Deletes state on `/clear`; keeps it otherwise. |
 
 ## Configuration
 
-Environment variables (set them in your shell or via `env` in settings):
-
-- `CLAUDE_MD_DISCOVERY_AGENTS_MD=0` — disable AGENTS.md discovery.
-- `CLAUDE_MD_DISCOVERY_IGNORE=/path/one:/path/two` — path prefixes (separated by `:`, `~` allowed) the plugin treats as invisible: never flagged, never tracked for changes, never used for suppression. `CLAUDE_MD_DISCOVERY_IGNORE=/` disables the plugin entirely.
+- `CLAUDE_MD_DISCOVERY_AGENTS_MD=0` — disable `AGENTS.md` discovery. (Claude Code never loads `AGENTS.md` natively; the plugin surfaces it only where no `CLAUDE.md` sits beside it.)
+- `CLAUDE_MD_DISCOVERY_IGNORE=/path/one:/path/two` — path prefixes the plugin treats as invisible. `/` disables the plugin entirely.
 - `CLAUDE_MD_DISCOVERY_STATE_DIR=/path` — override the state directory.
 
 ## Diagnostics
 
-Each session writes an event log beside its ledger (`~/.claude/plugin-state/claude-md-discovery-extended/<session>.log`, JSONL, reaped by the same 30-day GC). Logging is event-driven — steady-state tool calls write nothing — and stops at 1&nbsp;MB per session as a runaway guard. Events:
+State lives in `~/.claude/plugin-state/claude-md-discovery-extended/`: a `<session>.jsonl` ledger of loads and flags, a `<session>.pending.json` of suspicions awaiting their grace window, and a `<session>.log` of events (`flag`, `suppress` with the path whose content matched, `worktree_switch`, `compact_drop`, `clear_reset`, `gc`, `error`). Logging is event-driven — steady-state tool calls write nothing — and capped at 1&nbsp;MB per session. Hooks never break a session: unexpected exceptions exit 0, with the traceback landing in the log rather than vanishing.
 
-- `seed` — what was seeded and how: ancestor/project-file counts, scan method (`git`/`walk`/`skipped`), and whether the walk was truncated by its bounds (a truncated scan means missing suppression hashes, which is the likely explanation for a later unexpected flag).
-- `flag` — every discovery message emitted, with the triggering tool and target.
-- `suppress` — every hash-match suppression, naming the ledger path whose content matched (answers "why didn't it flag X?").
-- `compact_drop`, `clear_reset` / `clear_delete`, `gc` — lifecycle actions.
-- `error` — hooks must never break a session, so unexpected exceptions exit 0 — but the traceback lands here instead of vanishing.
-
-## Requirements
-
-- **Python 3.10+**: runs all hooks. Typically pre-installed on macOS and most Linux distributions.
+Abandoned state is garbage-collected after 30 days.
 
 ## Limitations
 
-- **Bash path extraction is best-effort**: paths are extracted from Bash commands via `shlex` tokenization. This handles common patterns (`cat /path/to/file`, `ls /some/dir`, quoted paths) but won't catch paths in redirects, pipes, or subshells.
-- **Suppression assumes the project copy is reachable**: a byte-identical copy inside the project tree suppresses the outside one on the theory that Claude Code's own discovery covers the project copy. If the model only ever touches the outside copy and never works in the corresponding project directory, those instructions don't enter context. This is deliberate: the worktree/clone case (where the content is the same and the session's real work happens inside the project) is overwhelmingly more common, and false nags are worse than a rare miss.
-- **Grep content matches**: `Grep` triggers discovery for its search root, but files surfaced purely as content matches deep in the tree don't trigger discovery until the model actually reads one.
+- **Bash extraction is best-effort.** Paths that never appear as command tokens — shell variables, `xargs`/`find` pipelines, files named only in a command's *output* — aren't seen. `cd` is covered separately by `CwdChanged`.
+- **`Grep` content matches.** A search rooted in one directory that returns hits deep elsewhere doesn't flag those directories until something actually touches them.
+- **Managed-policy `CLAUDE.md` is untested.** The docs list `memory_type: "Managed"` and the plugin handles it like any other load, but the probe didn't write to the machine-wide policy path to confirm it.
+- **Flagged files don't expand `@path` imports.** Claude Code only auto-resolves imports for files it loads natively, so the message tells Claude to follow them itself.
+
+## Requirements
+
+Python 3.10+ (pre-installed on macOS and most Linux distributions).
 
 ## License
 
